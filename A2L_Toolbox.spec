@@ -1,0 +1,58 @@
+# -*- mode: python ; coding: utf-8 -*-
+
+
+a = Analysis(
+    ['main.py'],
+    pathex=[],
+    binaries=[],
+    datas=[('app.ico', '.')],
+    hiddenimports=[
+        'core',
+        'core.elf_parser',
+        'core.map_parser',
+        'core.a2l_parser',
+        'core.sync_engine',
+        'core.dcm_handler',
+        'core.hex_handler',
+        'core.calib_engine',
+        'gui',
+        'gui.app',
+        'gui.calib',
+        'gui.calib.tab',
+        'gui.calib.editors',
+        'gui.calib.widgets',
+        'utils',
+        'utils.config',
+        'utils.logger',
+        'utils.appstate',
+    ],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+    optimize=0,
+)
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.datas,
+    [],
+    name='A2L_Toolbox',
+    icon='app.ico',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    console=False,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)

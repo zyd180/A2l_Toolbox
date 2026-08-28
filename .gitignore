@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.py[cod]
+*$py.class
 .Python
 
 # Virtual environments
@@ -15,6 +17,7 @@ build/
 dist/
 *.egg-info/
 *.egg
+*.exe
 
 # PyInstaller
 *.spec
@@ -28,9 +31,16 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
+Desktop.ini
 
 # Logs
 *.log
 
 # Test data (large files)
 test/
+
+# Session
+*.json
+
+# Internal notes
+项目优化建议.md
