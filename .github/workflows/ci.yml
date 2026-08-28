@@ -1,0 +1,119 @@
+name: A2L Toolbox CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: a2l-toolbox-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Tests Python ${{ matrix.python-version }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Compile Python sources
+        run: python -m compileall -q core gui utils main.py
+      - name: Import core modules
+        run: >-
+          python -c "import core.a2l_parser, core.calib_engine,
+          core.dcm_handler, core.elf_parser, core.hex_handler,
+          core.map_parser, core.sync_engine"
+      - name: GUI smoke test
+        timeout-minutes: 5
+        run: >-
+          python -c "import tkinter as tk; from gui.app import App;
+          root=tk.Tk(); App(root); root.after(100, root.destroy); root.mainloop()"
+
+  package:
+    name: Package Windows EXE
+    runs-on: windows-latest
+    timeout-minutes: 30
+    needs: tests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pyinstaller
+      - name: Build
+        run: pyinstaller --noconfirm --clean A2L_Toolbox.spec
+      - name: Verify package
+        shell: pwsh
+        run: |
+          if (!(Test-Path -LiteralPath "dist\A2L_Toolbox.exe")) {
+            throw "dist\A2L_Toolbox.exe 未生成"
+          }
+          Get-Item "dist\A2L_Toolbox.exe"
+      - name: Launch packaged smoke test
+        shell: pwsh
+        run: |
+          $process = Start-Process -FilePath "dist\A2L_Toolbox.exe" -PassThru
+          Start-Sleep -Seconds 5
+          if ($process.HasExited) { throw "EXE 启动后立即退出, exit code: $($process.ExitCode)" }
+          Stop-Process -Id $process.Id -Force
+      - name: Read version
+        id: version
+        shell: pwsh
+        run: |
+          $version = python -c "from utils.config import VERSION; print(VERSION)"
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$version" >> $env:GITHUB_OUTPUT
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: A2L_Toolbox-${{ github.sha }}
+          path: dist/A2L_Toolbox.exe
+      - name: Create version tag
+        id: tag
+        if: github.ref == 'refs/heads/master'
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.version.outputs.tag }}"
+          git fetch --tags origin
+          $existing = git ls-remote --tags origin "refs/tags/$tag"
+          if ($LASTEXITCODE -eq 0 -and $existing) {
+            "release=false" >> $env:GITHUB_OUTPUT
+            Write-Host "Tag $tag 已存在,不重复发布"
+          } else {
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag $tag
+            git push origin $tag
+            "release=true" >> $env:GITHUB_OUTPUT
+            Write-Host "已创建并推送 $tag"
+          }
+      - name: Create release archive
+        if: steps.tag.outputs.release == 'true' || startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: Compress-Archive -Path dist/A2L_Toolbox.exe -DestinationPath A2L_Toolbox-${{ steps.version.outputs.tag }}.zip
+      - name: Publish GitHub Release
+        if: steps.tag.outputs.release == 'true' || startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          files: A2L_Toolbox-${{ steps.version.outputs.tag }}.zip

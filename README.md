@@ -128,6 +128,10 @@ GUI 启动时默认最大化；日志区固定在窗口底部，支持折叠，�
 build.bat
 ```
 
+### CI
+
+GitHub Actions 配置位于 `.github/workflows/ci.yml`，在 Windows runner 上执行 Python 3.10/3.11/3.12 编译与导入检查、Tk GUI 冒烟测试和 PyInstaller 打包校验。主分支构建成功后会按 `utils/config.py` 中的版本号创建 Tag 并发布 EXE 压缩包。
+
 ### 地址映射操作流程
 
 1. 切换到「地址映射」标签页
