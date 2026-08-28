@@ -132,6 +132,10 @@ build.bat
 
 GitHub Actions 配置位于 `.github/workflows/ci.yml`，在 Windows runner 上执行 Python 3.10/3.11/3.12 编译与导入检查、Tk GUI 冒烟测试和 PyInstaller 打包校验。主分支构建成功后会按 `utils/config.py` 中的版本号创建 Tag 并发布 EXE 压缩包。
 
+### 一键推送 GitHub
+
+双击 `push_github.bat`，或执行 `powershell -File scripts/push_github.ps1`。脚本会校验远程仓库为 `zyd180/A2l_Toolbox`，自动提交本地改动，并使用 `--force` 让本地分支覆盖远程分支；本地 `.rar` 交付压缩包不会被自动提交。可使用 `-DryRun` 只检查远程和分支，不执行提交或推送。
+
 ### 地址映射操作流程
 
 1. 切换到「地址映射」标签页
