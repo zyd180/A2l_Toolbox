@@ -16,7 +16,7 @@ from utils.config import FILE_TYPES
 from utils.logger import timestamp, save_log_file
 from utils import appstate
 from core.elf_parser import parse_elf_symbols
-from core.map_parser import parse_map_symbols
+from core.map_parser import parse_map_symbols, parse_map_ownership
 from core.a2l_parser import update_a2l_file
 from core.sync_engine import sync_model_a2l
 
@@ -48,10 +48,9 @@ class SyncTab(BaseTab):
 
         self.tgt_var = tk.StringVar(value=st.get('sync_tgt', ''))
         self.out_var = tk.StringVar(value=st.get('sync_out', ''))
-        file_row(grp, 1, 'Base A2L:', self.tgt_var, self.browse_tgt)
-        file_row(grp, 2, 'A2L输出:', self.out_var, self.browse_out,
-                 hint='默认覆盖整车 A2L (启用备份时先生成 .bak)')
-        grp.columnconfigure(1, weight=1)
+        file_row(grp, 1, 'Base A2L:', self.tgt_var, self.browse_tgt, col=0)
+        file_row(grp, 1, 'A2L输出:', self.out_var, self.browse_out,
+                 hint='默认覆盖整车 A2L (启用备份时先生成 .bak)', col=1)
 
         opt = ttk.Frame(self.body, style='Card.TFrame')
         opt.pack(fill='x')
@@ -73,6 +72,12 @@ class SyncTab(BaseTab):
         self.addr_row = ttk.Frame(self.body, style='Card.TFrame')
         file_row(self.addr_row, 0, '地址文件:', self.sym_var, self.browse_sym,
                  hint='按扩展名自动识别 ELF/MAP; 对同步输出整体执行地址更新')
+        self.only_missing_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(self.addr_row,
+                        text='仅填补 0x0000 占位, 不覆盖已有真实地址',
+                        variable=self.only_missing_var,
+                        style='Card.TCheckbutton').grid(
+            row=2, column=1, sticky='w', pady=(2, 0))
 
     # ---------- 浏览 ----------
     def browse_src(self):
@@ -138,9 +143,10 @@ class SyncTab(BaseTab):
         appstate.save_app_state(sync_sources=sources, sync_tgt=tgt, sync_out=out,
                                 sync_sym=sym)
         threading.Thread(target=self._run, daemon=True,
-                         args=(sources, tgt, out, purge, backup, sym)).start()
+                         args=(sources, tgt, out, purge, backup, sym,
+                               self.only_missing_var.get())).start()
 
-    def _run(self, sources, tgt, out, purge, backup, sym=''):
+    def _run(self, sources, tgt, out, purge, backup, sym='', only_missing=True):
         start = time.time()
         try:
             self.app.clear_log()
@@ -160,6 +166,13 @@ class SyncTab(BaseTab):
                 log(f'完成后自动更新地址: {sym}')
             log('=' * 60)
 
+            # 归属裁决: 同一份 MAP 既用于"按定义方裁决"(防止引用方的宽限值覆盖定义方),
+            # 也用于完成后的地址更新
+            owner_map = {}
+            if sym and sym.lower().endswith('.map'):
+                owner_map = parse_map_ownership(sym)
+                log(f'符号归属 MAP: {len(owner_map)} 条 (按定义方裁决, 引用方声明不覆盖)')
+
             # 依次同步: 第一个模型以 Base A2L 为基准, 后续模型基于上次输出继续
             all_stats = []
             cur_tgt = tgt
@@ -169,7 +182,8 @@ class SyncTab(BaseTab):
                                     '[%d/%d] 同步模型: %s'
                                     % (i + 1, len(sources), Path(src).name))
                 stats = sync_model_a2l(src, cur_tgt, out, purge=purge,
-                                       backup=(backup and i == 0), log=log)
+                                       backup=(backup and i == 0), log=log,
+                                       owner_map=owner_map)
                 all_stats.append((Path(src).name, stats))
                 cur_tgt = out
 
@@ -177,10 +191,12 @@ class SyncTab(BaseTab):
             log(f"\n{'='*60}")
             log('同步统计')
             log(f"{'='*60}")
-            tot_r = tot_a = tot_d = tot_s = tot_w = 0
+            tot_r = tot_a = tot_d = tot_s = tot_w = tot_skip = 0
             for name, stats in all_stats:
                 line = (f"  {name}: 对象 {stats['src_total']}, "
                         f"替换/更新 {stats['replaced']}, 新增 {stats['added']}")
+                if stats.get('skipped_ref'):
+                    line += f", 按定义方跳过 {stats['skipped_ref']}"
                 if purge:
                     line += f", 删除 {stats['deleted']}"
                 fstats = stats.get('function', {})
@@ -193,15 +209,17 @@ class SyncTab(BaseTab):
                 tot_d += stats['deleted']
                 tot_s += len(stats['kept_same'])
                 tot_w += len(stats['kept_warn'])
+                tot_skip += stats.get('skipped_ref', 0)
             log('-' * 60)
-            log(f'  合计: 替换/更新 {tot_r}, 新增 {tot_a}, 删除 {tot_d}, 保持未变 {tot_s}')
+            log(f'  合计: 替换/更新 {tot_r}, 新增 {tot_a}, 删除 {tot_d}, 保持未变 {tot_s}'
+                + (f', 按定义方跳过 {tot_skip}' if tot_skip else ''))
             if purge:
                 log(f'  引用保留警告: {tot_w}')
             log(f'  处理耗时:     {elapsed:.2f}s')
             log(f"{'='*60}")
 
             # ---- 内嵌可选步骤: 对输出 A2L 整体刷新地址 ----
-            addr_info = ''
+            addr_rate = addr_updated = addr_matched = None
             if sym:
                 log('')
                 log('>>> 自动更新地址: %s' % Path(sym).name)
@@ -212,14 +230,19 @@ class SyncTab(BaseTab):
                     symbols = (parse_map_symbols(sym) if stype == 'map'
                                else parse_elf_symbols(sym))
                     log('  地址文件类型: %s, 符号数: %d' % (stype.upper(), len(symbols)))
-                    total, matched, updated, _x, astats = update_a2l_file(out, symbols, out)
+                    total, matched, updated, _x, astats = update_a2l_file(
+                        out, symbols, out, only_missing=only_missing)
                     un = astats.get('unmatched', 0)
-                    log('  变量 %d | 匹配 %d | 地址更新 %d | 未匹配 %d'
-                        % (total, matched, updated, un))
-                    addr_info = f'\n地址更新: {updated}/{matched} (未匹配 {un})'
+                    kept = astats.get('kept_existing', 0)
+                    rate = (100.0 * matched / total) if total else 0.0
+                    addr_rate, addr_updated, addr_matched = rate, updated, matched
+                    log('  变量 %d | 匹配 %d (%.1f%%) | 地址更新 %d | 未匹配 %d'
+                        ' | 保留原地址 %d' % (total, matched, rate, updated, un, kept))
+                    if rate < 50.0:
+                        log('  [警告] 匹配率过低: 该地址文件与输出 A2L 很可能不是同一次构建')
                 except Exception as ae:
                     log(f'  地址更新失败: {ae}')
-                    addr_info = '\n地址更新: 失败 (%s)' % ae
+                    addr_rate = -1.0
 
             log_path = save_log_file(self.app.log_buffer, self.app.log_queue, out)
             if log_path:
@@ -227,14 +250,27 @@ class SyncTab(BaseTab):
 
             self.app.root.after(0, self.app.status, 'ok',
                                 f'完成! {len(sources)} 个模型: 更新 {tot_r}, 新增 {tot_a}, 删除 {tot_d}')
-            purge_str = f'删除旧版遗留: {tot_d}\n' if purge else ''
-            msg = (f'同步完成!\n\n模型数: {len(sources)}\n替换/更新: {tot_r}\n新增: {tot_a}\n'
-                   f'{purge_str}保持未变: {tot_s}{addr_info}\n耗时: {elapsed:.2f}s\n\n输出: {out}')
+            # 完成反馈: 结果卡片常驻右停靠面板 (不再弹 messagebox)
+            metrics = [('模型数', len(sources)),
+                       ('替换/更新', tot_r), ('新增', tot_a)]
+            if purge:
+                metrics.append(('删除旧版遗留', tot_d))
+            metrics.append(('保持未变', tot_s))
+            if tot_skip:
+                metrics.append(('按定义方跳过', tot_skip))
+            if sym and addr_rate is not None and addr_rate >= 0:
+                metrics.append(('地址更新', '%d/%d (%.1f%%)'
+                                % (addr_updated, addr_matched, addr_rate)))
+            warns = []
             if tot_w:
-                msg += f'\n\n注意: {tot_w} 个对象因块外仍有引用而未删除, 详见日志!'
-            if log_path:
-                msg += f'\n\n日志: {log_path}'
-            self.app.info('完成', msg)
+                warns.append('%d 个对象因块外仍有引用而未删除, 详见日志' % tot_w)
+            if sym and addr_rate is not None and addr_rate < 50.0:
+                warns.append('地址匹配率 %.1f%% 过低: 地址文件与输出 A2L 很可能'
+                             '不是同一次构建' % addr_rate)
+            paths = [str(out)] + ([log_path] if log_path else [])
+            self.app.root.after(0, lambda: self.app.show_result(
+                '同步完成 (%d 个模型)' % len(sources),
+                metrics=metrics, paths=paths, warns=warns, ts=timestamp()))
         except Exception as e:
             self.app.log_msg(f'错误: {e}\n{traceback.format_exc()}')
             self.app.root.after(0, self.app.status, 'err', f'出错: {e}')

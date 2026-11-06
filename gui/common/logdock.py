@@ -13,8 +13,9 @@ from utils.logger import pick_log_tag
 class LogDock(tk.Frame):
     """日志区组件. 线程安全: 任意线程可调 log_msg/clear/save."""
 
-    def __init__(self, master):
+    def __init__(self, master, on_activity=None):
         super().__init__(master, bg=COLORS['border'], padx=1, pady=1)
+        self.on_activity = on_activity      # 新日志落面板时回调 (主线程), 供未读标记
         self.buffer = []
         self.queue = []             # 工作线程写入, 主线程批量消费
         self._flush_pending = False
@@ -84,22 +85,33 @@ class LogDock(tk.Frame):
         self.after(ms, fn)
 
     # ---------- 写入 ----------
-    def log_msg(self, msg):
+    def log_msg(self, msg, level=None):
+        """线程安全写日志.
+
+        msg 为纯文本时按 pick_log_tag 关键词猜测着色 (兼容旧调用);
+        显式传 level ('err'/'warn'/'ok'/'title'/'dim'/'info') 或 msg 传
+        (level, text) 元组时按结构化级别着色, 不再做关键词猜测.
+        纯文本与元组混用时元组优先解析.
+        """
+        if isinstance(msg, tuple):
+            if len(msg) == 2:
+                level, msg = msg
+            else:
+                level = None
         if not self._on_main():
             # 工作线程: 只入队, 由主线程定时批量渲染, 避免逐条调度卡事件队列
-            self.queue.append(msg)
+            self.queue.append((msg, level))
             if not self._flush_pending:
                 self._flush_pending = True
                 self._after(100, self._flush_queue)
             return
-        self._insert([msg])
+        self._insert([(msg, level)])
 
     def _flush_queue(self):
         self._flush_pending = False
         pending, self.queue = self.queue, []
-        if not pending:
-            return
-        self._insert(pending)
+        if pending:
+            self._insert(pending)
         if self.queue:
             self._flush_pending = True
             self._after(100, self._flush_queue)
@@ -110,16 +122,22 @@ class LogDock(tk.Frame):
             self._flush_queue()
 
     def _insert(self, msgs):
+        """msgs: [(text, level_or_None)]; buffer 只存纯文本 (save_log_file 依赖)."""
         self.text.config(state='normal')
-        for msg in msgs:
-            tag = pick_log_tag(msg)
+        for msg, level in msgs:
+            tag = level or pick_log_tag(msg)
             if tag:
                 self.text.insert(tk.END, msg + '\n', tag)
             else:
                 self.text.insert(tk.END, msg + '\n')
+            self.buffer.append(msg)
         self.text.see(tk.END)
         self.text.config(state='disabled')
-        self.buffer.extend(msgs)
+        if self.on_activity is not None:
+            try:
+                self.on_activity()
+            except Exception:
+                pass
 
     # ---------- 清空 / 导出 ----------
     def clear(self):

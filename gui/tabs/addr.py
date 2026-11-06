@@ -49,8 +49,8 @@ class AddrTab(BaseTab):
         grp_io.pack(fill='x', pady=(0, SPACE['sm']))
         self.a2l_in_var = tk.StringVar(value=st.get('addr_in', ''))
         self.a2l_out_var = tk.StringVar(value=st.get('addr_out', ''))
-        file_row(grp_io, 0, 'A2L输入:', self.a2l_in_var, self.browse_a2l_in)
-        file_row(grp_io, 1, 'A2L输出:', self.a2l_out_var, self.browse_a2l_out)
+        file_row(grp_io, 0, 'A2L输入:', self.a2l_in_var, self.browse_a2l_in, col=0)
+        file_row(grp_io, 0, 'A2L输出:', self.a2l_out_var, self.browse_a2l_out, col=1)
 
         opt = ttk.Frame(self.body, style='Card.TFrame')
         opt.pack(fill='x')
@@ -170,13 +170,17 @@ class AddrTab(BaseTab):
                 log(f'\n日志已保存: {log_path}')
 
             self.app.root.after(0, self.app.status, 'ok', f'完成! 更新 {updated}/{matched}')
-            msg = (f'更新完成!\n\n变量总数: {total}\n匹配: {matched}({rate})\n'
-                   f'更新: {updated}\n未变: {stats["unchanged"]}\n'
-                   f'未匹配: {stats["unmatched"]}\n已删除: {stats["removed_count"]}\n'
-                   f'耗时: {elapsed:.2f}s')
-            if log_path:
-                msg += f'\n\n日志: {log_path}'
-            self.app.info('完成', msg)
+            # 完成反馈: 结果卡片常驻右停靠面板 (不再弹 messagebox)
+            self.app.root.after(0, lambda: self.app.show_result(
+                '地址映射完成',
+                metrics=[('变量总数', total),
+                         ('匹配', '%s (%s)' % (matched, rate)),
+                         ('地址更新', updated),
+                         ('地址未变', stats['unchanged']),
+                         ('未匹配', stats['unmatched']),
+                         ('已删除', stats['removed_count'])],
+                paths=[a2l_out] + ([log_path] if log_path else []),
+                ts=timestamp()))
         except Exception as e:
             self.app.log_msg(f'错误: {e}\n{traceback.format_exc()}')
             self.app.root.after(0, self.app.status, 'err', f'出错: {e}')

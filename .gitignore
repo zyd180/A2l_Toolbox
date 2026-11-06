@@ -36,8 +36,9 @@ Desktop.ini
 # Logs
 *.log
 
-# Test data (large files)
-test/
+# Test data (large files) - 只忽略样本数据, 放行回归用例目录
+test/*
+!test/regress/
 
 # Session
 *.json

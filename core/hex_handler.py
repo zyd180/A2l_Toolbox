@@ -1,6 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Intel HEX 文件处理模块 - 加载、保存、编码"""
+"""Intel HEX 文件处理模块 - 读写 + 标定值写入 (物理值 -> 原始字节编码)
+
+值解码 (原始字节 -> 物理值) 由 core.calib_engine.CalibSession 负责, 本模块不再保留
+第二份实现, 避免 COEFFS 方向/字节序在两处各写一遍而出现分叉.
+"""
 
 import struct
 
@@ -15,95 +19,12 @@ _DT_INFO = {
     'FLOAT32_IEEE': (4, 'f', False), 'FLOAT64_IEEE': (8, 'd', False),
 }
 
-# Record Layout 名称 -> 实际数据类型（从Record Layout定义中推断）
-_RL_TYPE_MAP = {
-    'Lookup1D_BOOLEAN': 'UBYTE',
-    'Lookup1D_UBYTE': 'UBYTE',
-    'Lookup1D_BYTE': 'SBYTE',
-    'Lookup1D_UWORD': 'UWORD',
-    'Lookup1D_WORD': 'SWORD',
-    'Lookup1D_ULONG': 'ULONG',
-    'Lookup1D_LONG': 'SLONG',
-    'Lookup1D_FLOAT32_IEEE': 'FLOAT32_IEEE',
-    'Lookup1D_FLOAT64_IEEE': 'FLOAT64_IEEE',
-    'Lookup2D_BOOLEAN': 'UBYTE',
-    'Lookup2D_UBYTE': 'UBYTE',
-    'Lookup2D_BYTE': 'SBYTE',
-    'Lookup2D_UWORD': 'UWORD',
-    'Lookup2D_WORD': 'SWORD',
-    'Lookup2D_ULONG': 'ULONG',
-    'Lookup2D_LONG': 'SLONG',
-    'Lookup2D_FLOAT32_IEEE': 'FLOAT32_IEEE',
-    'Lookup2D_FLOAT64_IEEE': 'FLOAT64_IEEE',
-    'Scalar_BOOLEAN': 'UBYTE',
-    'Scalar_UBYTE': 'UBYTE',
-    'Scalar_BYTE': 'SBYTE',
-    'Scalar_UWORD': 'UWORD',
-    'Scalar_SWORD': 'SWORD',
-    'Scalar_ULONG': 'ULONG',
-    'Scalar_LONG': 'SLONG',
-    'Scalar_FLOAT32_IEEE': 'FLOAT32_IEEE',
-    'Scalar_FLOAT64_IEEE': 'FLOAT64_IEEE',
+# 整数类型的可取范围 (struct 格式 -> (lo, hi)), 打包前显式校验用
+_INT_RANGE = {
+    'B': (0, 255), 'b': (-128, 127),
+    'H': (0, 65535), 'h': (-32768, 32767),
+    'I': (0, 4294967295), 'i': (-2147483648, 2147483647),
 }
-
-
-def get_data_type(record_layout):
-    """从Record Layout名称推断数据类型"""
-    if not record_layout:
-        return None
-    
-    # 先查映射表
-    dt = _RL_TYPE_MAP.get(record_layout)
-    if dt:
-        return dt
-    
-    # 尝试从名称中提取数据类型
-    upper = record_layout.upper()
-    for dtype in _DT_INFO:
-        if dtype in upper:
-            return dtype
-    
-    return None
-
-
-# ==================== 编码函数 ====================
-
-def encode_raw(phys, coeffs, dtype, byte_order):
-    """物理量编码为 HEX 原始字节. coeffs=(a,b,c,d,e,f) RAT_FUNC 系数.
-    Simulink 生成的 COEFFS 为 phys→raw 方向 (longid 形如 "Q = V*100"),
-    故直接正向求值: raw = (a·phys²+b·phys+c)/(d·phys²+e·phys+f).
-    返回 (bytes, warn); 无法编码时返回 (None, 原因)"""
-    info = _DT_INFO.get(dtype)
-    if not info:
-        return None, '未知数据类型 %s' % dtype
-    size, fmt, is_int = info
-    msb_first = byte_order == 'BYTE_ORDER_MSB_FIRST'
-    endian = '>' if msb_first else '<'
-    if not is_int:
-        try:
-            return struct.pack(endian + fmt, float(phys)), None
-        except (OverflowError, ValueError):
-            return None, '浮点值非法: %s' % phys
-    if coeffs is None:
-        return None, '无 COEFFS 系数'
-    a, b, c, d, e, f = coeffs
-    lo = 0 if fmt == 'B' else (-128 if fmt == 'b' else
-                                0 if fmt == 'H' else (-32768 if fmt == 'h' else
-                                                       0 if fmt == 'I' else -2147483648))
-    hi = (255 if fmt == 'B' else 127 if fmt == 'b' else
-          65535 if fmt == 'H' else 32767 if fmt == 'h' else
-          4294967295 if fmt == 'I' else 2147483647)
-    den = d * phys * phys + e * phys + f
-    if den == 0:
-        return None, '转换公式分母为 0'
-    x = (a * phys * phys + b * phys + c) / den
-    xr = int(round(x))
-    warn = None
-    if xr < lo or xr > hi:
-        warn = '值 %s 编码 %d 超出 %s 范围, 已截断' % (phys, xr, dtype)
-        xr = max(lo, min(hi, xr))
-    return struct.pack(endian + fmt, xr), warn
-
 
 # ==================== HEX 文件操作 ====================
 
@@ -146,8 +67,10 @@ def load_intel_hex(path, log=None):
     return mem
 
 
-def save_intel_hex(path, mem, rec_len=32):
-    """按连续段输出 Intel HEX (记录04 扩展线性地址 + 数据记录 + EOF)"""
+def save_intel_hex(path, mem, rec_len=32, eladr_addrs=None):
+    """按连续段输出 Intel HEX (记录04 扩展线性地址 + 数据记录 + EOF).
+    eladr_addrs: 需要强制重发 ELADR 的地址 (如 MEMORY_SEGMENT 段边界, 对标 INCA:
+    段切换处即使地址连续也重发地址记录)"""
     addrs = sorted(mem)
     segs = []
     s = addrs[0]
@@ -160,11 +83,13 @@ def save_intel_hex(path, mem, rec_len=32):
     segs.append((s, p + 1))
     lines = []
     cur_base = None
+    eladr_set = eladr_addrs or ()
     for s, e in segs:
+        cur_base = None    # 每个连续段强制重发 ELADR (对标 INCA 导出的记录序列)
         off = s
         while off < e:
             hi = off >> 16
-            if hi != cur_base:
+            if hi != cur_base or off in eladr_set:
                 rec = bytes([2, 0, 0, 4, hi >> 8, hi & 0xFF])
                 lines.append(':%s%02X' % (rec.hex().upper(),
                                           (256 - (sum(rec) & 0xFF)) & 0xFF))
@@ -177,110 +102,12 @@ def save_intel_hex(path, mem, rec_len=32):
                                       (256 - (sum(payload) & 0xFF)) & 0xFF))
             off += n
     lines.append(':00000001FF')
-    with open(path, 'w', encoding='utf-8', newline='\n') as f:
-        f.write('\n'.join(lines) + '\n')
+    # CRLF 行尾 + DOS EOF 控制符 \x1a (对标 INCA 导出)
+    with open(path, 'w', encoding='utf-8', newline='') as f:
+        f.write('\r\n'.join(lines) + '\r\n\x1a')
 
 
 # ==================== 标定值读写 ====================
-
-def read_calibration_value(mem, addr, data_type, coeffs=None, byte_order=None):
-    """从内存读取标定量物理值
-    
-    根据ASAM MCD-2 MC标准：
-    - COEFFS a b c d e f
-    - 公式: raw = (a*phys^2 + b*phys + c) / (d*phys^2 + e*phys + f)
-    - 需要反向求解 phys
-    
-    Args:
-        mem: 内存字典 {地址: 字节值}
-        addr: 标定量地址
-        data_type: 数据类型
-        coeffs: COEFFS (a,b,c,d,e,f)
-        byte_order: 字节序
-    
-    Returns:
-        (物理值, 错误信息)
-    """
-    info = _DT_INFO.get(data_type)
-    if not info:
-        return None, '未知数据类型: %s' % data_type
-    
-    size, fmt, is_int = info
-    msb_first = byte_order == 'BYTE_ORDER_MSB_FIRST'
-    endian = '>' if msb_first else '<'
-    
-    # 检查地址是否在内存中
-    for i in range(size):
-        if (addr + i) not in mem:
-            return None, '地址 0x%X+%d 不在HEX覆盖范围内' % (addr, i)
-    
-    # 读取原始字节
-    raw_bytes = bytes(mem[addr + i] for i in range(size))
-    
-    # 解包得到原始值
-    try:
-        raw_value = struct.unpack(endian + fmt, raw_bytes)[0]
-    except struct.error as e:
-        return None, '解包失败: %s' % str(e)
-    
-    # 检查nan
-    if isinstance(raw_value, float) and raw_value != raw_value:
-        return None, '原始值为nan'
-    
-    # 无系数，直接返回原始值
-    if coeffs is None:
-        return raw_value, None
-    
-    # 有系数，需要反算物理值
-    # raw = (a*phys^2 + b*phys + c) / (d*phys^2 + e*phys + f)
-    a, b, c, d, e, f = coeffs
-    raw = raw_value
-    
-    # 检查是否是线性情况 (a=0, d=0)
-    if a == 0 and d == 0:
-        # 线性: raw = (b*phys + c) / (e*phys + f)
-        # raw*(e*phys + f) = b*phys + c
-        # raw*e*phys + raw*f = b*phys + c
-        # (raw*e - b)*phys = c - raw*f
-        # phys = (c - raw*f) / (raw*e - b)
-        
-        denom = raw * e - b
-        if denom == 0:
-            return None, '转换公式分母为0 (raw*e - b == 0)'
-        phys = (c - raw * f) / denom
-    else:
-        # 一般二次情况
-        # raw = (a*phys^2 + b*phys + c) / (d*phys^2 + e*phys + f)
-        # raw*(d*phys^2 + e*phys + f) = a*phys^2 + b*phys + c
-        # raw*d*phys^2 + raw*e*phys + raw*f = a*phys^2 + b*phys + c
-        # (raw*d - a)*phys^2 + (raw*e - b)*phys + (raw*f - c) = 0
-        
-        A = raw * d - a
-        B = raw * e - b
-        C = raw * f - c
-        
-        if A == 0:
-            # 线性方程
-            if B == 0:
-                return None, '无法求解物理值'
-            phys = -C / B
-        else:
-            # 二次方程: A*phys^2 + B*phys + C = 0
-            discriminant = B * B - 4 * A * C
-            if discriminant < 0:
-                return None, '无实数解 (判别式 < 0)'
-            sqrt_disc = discriminant ** 0.5
-            phys1 = (-B + sqrt_disc) / (2 * A)
-            phys2 = (-B - sqrt_disc) / (2 * A)
-            # 选择更合理的解
-            phys = phys1 if abs(phys1) <= abs(phys2) else phys2
-    
-    # 检查nan
-    if phys != phys:
-        return None, '转换结果为nan'
-    
-    return phys, None
-
 
 def write_calibration_value(mem, addr, phys_value, data_type, coeffs=None, byte_order=None):
     """将物理值写入内存
@@ -305,9 +132,13 @@ def write_calibration_value(mem, addr, phys_value, data_type, coeffs=None, byte_
         return False, '未知数据类型: %s' % data_type
     
     size, fmt, is_int = info
-    msb_first = byte_order == 'BYTE_ORDER_MSB_FIRST'
+    # 字节序声明有多种写法: ASAP2 标准为 MSB_FIRST/MSB_LAST, 部分工具输出
+    # BYTE_ORDER_MSB_FIRST / MSB_LAST_MOTOROLA。必须与 calib_engine.cm_byte_order
+    # 认的集合一致, 否则会出现"读按大端解码、写按小端编码"的不对称。
+    msb_first = byte_order in ('MSB_FIRST', 'BYTE_ORDER_MSB_FIRST', 'MSB_LAST_MOTOROLA')
     endian = '>' if msb_first else '<'
-    
+    lo, hi = _INT_RANGE[fmt] if is_int else (None, None)
+
     if not is_int:
         # 浮点类型直接打包
         try:
@@ -317,35 +148,30 @@ def write_calibration_value(mem, addr, phys_value, data_type, coeffs=None, byte_
     else:
         # 整数类型需要正向编码
         if coeffs is None:
-            # 无系数，直接使用整数值
+            # 无系数, 物理值即原始值; 同样要做范围检查, 否则 struct.pack 抛异常而非返回错误
+            raw_int = int(round(float(phys_value)))
+            if raw_int < lo or raw_int > hi:
+                return False, '值 %d 超出 %s 范围 [%d, %d]' % (raw_int, data_type, lo, hi)
             try:
-                raw_bytes = struct.pack(endian + fmt, int(round(phys_value)))
-            except (OverflowError, ValueError) as e:
-                return False, '整数值非法: %s' % str(e)
+                raw_bytes = struct.pack(endian + fmt, raw_int)
+            except struct.error as e:
+                return False, '打包失败: %s' % str(e)
         else:
             # 使用COEFFS正向编码
             # raw = (a*phys^2 + b*phys + c) / (d*phys^2 + e*phys + f)
             a, b, c, d, e, f = coeffs
             phys = phys_value
-            
+
             denom = d * phys * phys + e * phys + f
             if denom == 0:
                 return False, '转换公式分母为0'
-            
+
             raw = (a * phys * phys + b * phys + c) / denom
             raw_int = int(round(raw))
-            
-            # 检查范围
-            lo = 0 if fmt == 'B' else (-128 if fmt == 'b' else
-                                        0 if fmt == 'H' else (-32768 if fmt == 'h' else
-                                                               0 if fmt == 'I' else -2147483648))
-            hi = (255 if fmt == 'B' else 127 if fmt == 'b' else
-                  65535 if fmt == 'H' else 32767 if fmt == 'h' else
-                  4294967295 if fmt == 'I' else 2147483647)
-            
+
             if raw_int < lo or raw_int > hi:
                 return False, '编码值 %d 超出 %s 范围 [%d, %d]' % (raw_int, data_type, lo, hi)
-            
+
             try:
                 raw_bytes = struct.pack(endian + fmt, raw_int)
             except struct.error as e:

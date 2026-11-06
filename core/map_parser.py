@@ -66,6 +66,53 @@ def parse_map_symbols(map_path):
     return symbols
 
 
+# ==================== 符号归属 (定义模块) ====================
+
+# 链接 MAP 的符号行 (Green Hills / TI 多列格式) 最后一列是"定义该符号的目标文件":
+#   0x8040005b 0x8040005b  1 g ABM_bCrashActv_E  ...  ASW\...\code\ABM_AirbModuleEvln.o
+# 这是判定"该变量由哪个 SWC 定义"的权威依据 —— A2L 本身不记录 owner。
+_MAP_OWNER_RE = re.compile(
+    r'^\s*0[xX][0-9A-Fa-f]+\s+0[xX][0-9A-Fa-f]+\s+\d+\s+\S+\s+'
+    r'([A-Za-z_]\w*)\s+.*?(\S+\.o)\s*$', re.MULTILINE)
+
+
+def parse_map_ownership(map_path):
+    """解析 MAP, 返回 {符号名: 定义它的目标文件名(不含 .o)}.
+
+    没有 ".o" 列的 MAP (其他链接器/裁剪过的表) 返回 {}, 调用方应降级到启发式.
+    """
+    try:
+        with open(map_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+    except OSError:
+        return {}
+    out = {}
+    for m in _MAP_OWNER_RE.finditer(content):
+        sym = m.group(1)
+        obj = re.split(r'[\\/]', m.group(2))[-1]
+        if obj.lower().endswith('.o'):
+            obj = obj[:-2]
+        if sym not in out:
+            out[sym] = obj
+    return out
+
+
+# A2L 对象名 -> MAP 符号名 的后缀候选
+# (Simulink 代码生成: _MP 测量点 / _E 边沿 / _O 输出 / _C 标定 / _M 中间量)
+MAP_SYMBOL_SUFFIXES = ('', '_MP', '_E', '_O', '_C', '_M')
+
+
+def map_owner(map_idx, name):
+    """按对象名(含 Simulink 后缀)查定义该符号的模块名; 查不到返回 None"""
+    if not map_idx or not name:
+        return None
+    for suf in MAP_SYMBOL_SUFFIXES:
+        obj = map_idx.get(name + suf)
+        if obj:
+            return obj
+    return None
+
+
 if __name__ == '__main__':
     import sys
     if len(sys.argv) < 2:

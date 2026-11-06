@@ -34,6 +34,25 @@ SPACE = {
     'xl': 24,
 }
 
+# ---------- 圆角 / 分割线 / 悬停 (工作台化布局的补齐 token) ----------
+# Tk 原生不画圆角, 这些 token 目前用于自绘控件 (导航条/结果卡片/网格),
+# 先集中定义, 阶段1 起自绘组件一律从这里取值.
+RADIUS = {
+    'sm': 3,
+    'md': 6,
+    'lg': 10,
+}
+
+DIVIDER = COLORS['border']          # 面板分割线
+HOVER_BG = COLORS['tab_idle']       # 通用悬停底色
+SELECT_BG = COLORS['primary']       # 选中态底色
+SELECT_FG = '#ffffff'               # 选中态文字
+
+# 密度档: compact 用于右停靠面板/表格行, comfortable 用于表单
+# (在 FONT 定义之后填充, 见文件下方 DENSITY.update)
+DENSITY = {}
+DENSITY_DEFAULT = 'comfortable'
+
 # ---------- 字号阶梯 ----------
 FONT_FAMILY = '微软雅黑'
 FONT_LOG = 'Consolas'
@@ -44,6 +63,12 @@ FONT = {
     'log':    (FONT_LOG, 9),
     'log_b':  (FONT_LOG, 9, 'bold'),
 }
+
+# 密度档具体值 (FONT 已定义): compact 用于右停靠面板/表格行, comfortable 用于表单
+DENSITY.update({
+    'compact':     {'row': 22, 'pad_v': 2, 'pad_h': 6, 'font': FONT['body']},
+    'comfortable': {'row': 26, 'pad_v': 4, 'pad_h': 8, 'font': FONT['body']},
+})
 
 # ---------- 状态栏语义色 ----------
 STATUS_STYLES = {

@@ -29,18 +29,25 @@ def timestamp(fmt="display"):
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _plain(line):
+    """兼容日志队列的两种元素: 纯文本 或 (text, level) 元组 -> 取纯文本"""
+    if isinstance(line, tuple) and len(line) == 2 and isinstance(line[0], str):
+        return line[0]
+    return line
+
+
 def save_log_file(log_buffer, log_queue, output_path):
     """保存日志到文件
-    
+
     Args:
-        log_buffer: 已渲染的日志列表
-        log_queue: 待渲染的日志队列
+        log_buffer: 已渲染的日志列表 (纯文本)
+        log_queue: 待渲染的日志队列 (纯文本或 (level, text) 元组)
         output_path: 输出文件路径
-    
+
     Returns:
         日志文件路径，失败返回 None
     """
-    lines = log_buffer + log_queue
+    lines = [_plain(l) for l in (list(log_buffer) + list(log_queue))]
     if not lines:
         return None
     try:

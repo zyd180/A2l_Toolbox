@@ -34,12 +34,15 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
       - name: Compile Python sources
-        run: python -m compileall -q core gui utils main.py
+        run: python -m compileall -q core gui utils main.py test/regress
       - name: Import core modules
         run: >-
           python -c "import core.a2l_parser, core.calib_engine,
           core.dcm_handler, core.elf_parser, core.hex_handler,
           core.map_parser, core.sync_engine"
+      - name: Regression suite
+        timeout-minutes: 10
+        run: python test/regress/run_all.py
       - name: GUI smoke test
         timeout-minutes: 5
         run: >-

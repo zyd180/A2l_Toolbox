@@ -9,17 +9,23 @@ from pathlib import Path
 from gui.theme import COLORS, FONT
 
 
-def file_row(parent, row, label, var, cmd, hint=None):
-    """标签 + 输入框 + 浏览按钮 的栅格行; hint 占用下一行."""
+def file_row(parent, row, label, var, cmd, hint=None, col=0):
+    """标签 + 输入框 + 浏览按钮 的栅格行; hint 占下一行.
+
+    col=0/1 支持"一行两组"的两列表单 (每组占 4 列: 标签/输入/按钮/间隔),
+    默认 col=0 与旧调用完全兼容."""
+    base = col * 4
     ttk.Label(parent, text=label, style='Card.TLabel').grid(
-        row=row, column=0, sticky='w', padx=(2, 6), pady=3)
+        row=row, column=base, sticky='w', padx=(2, 6), pady=3)
     ttk.Entry(parent, textvariable=var).grid(
-        row=row, column=1, sticky='ew', padx=(0, 6), pady=3)
-    ttk.Button(parent, text='浏览...', command=cmd).grid(row=row, column=2, pady=3)
+        row=row, column=base + 1, sticky='ew', padx=(0, 6), pady=3)
+    ttk.Button(parent, text='浏览...', command=cmd).grid(
+        row=row, column=base + 2, pady=3)
     if hint:
-        ttk.Label(parent, text=hint, style='CardMuted.TLabel').grid(
-            row=row + 1, column=1, sticky='w', padx=(0, 6))
-    parent.columnconfigure(1, weight=1)
+        ttk.Label(parent, text=hint, style='CardMuted.TLabel',
+                  wraplength=300, justify='left').grid(
+            row=row + 1, column=base, columnspan=3, sticky='w', padx=(0, 6))
+    parent.columnconfigure(base + 1, weight=1)
 
 
 class PathListbox(ttk.Frame):

@@ -86,18 +86,29 @@ A2l_Toolbox/
 ├── main.py                  # 程序入口
 ├── gui/                     # GUI 模块
 │   ├── __init__.py
-│   ├── app.py               # 主窗口类
-│   └── calib/               # 在线标定页签 (对标 INCA)
-│       ├── tab.py           # 页签主界面 (分组树/搜索/表格)
-│       ├── editors.py       # VALUE/CURVE/MAP/轴点 编辑器
-│       └── widgets.py       # CellGrid 可编辑色阶网格控件
+│   ├── app.py               # 主窗口壳 (横幅/侧导航/内容栈/全局按钮/日志坞/状态栏)
+│   ├── theme.py             # 设计令牌 (色板/间距/字号) + ttk 样式工厂
+│   ├── common/              # 通用件
+│   │   ├── logdock.py       # 日志坞 (线程安全队列渲染/着色/折叠/导出)
+│   │   ├── sidenav.py       # 左侧大卡片导航
+│   │   └── widgets.py       # 文件行 / 路径列表
+│   └── tabs/                # 页签
+│       ├── base.py          # BaseTab 契约 (TITLE/DESC/HAS_RUN/RUN_LABEL/HAS_TEST)
+│       ├── registry.py      # 页签注册表
+│       ├── addr.py          # 地址映射
+│       ├── merge.py         # 合并 A2L
+│       ├── sync.py          # 更新 A2L (模型版本同步)
+│       └── calib/           # 在线标定页签 (对标 INCA)
+│           ├── tab.py       # 页签主界面 (分组树/搜索/表格)
+│           ├── editors.py   # VALUE/CURVE/MAP/轴点 编辑器
+│           └── widgets.py   # CellGrid 可编辑色阶网格控件
 ├── core/                    # 核心功能模块
 │   ├── __init__.py
 │   ├── elf_parser.py        # ELF 解析
 │   ├── map_parser.py        # MAP 解析
 │   ├── a2l_parser.py        # A2L 解析
-│   ├── dcm_handler.py       # DCM 解析 + A2L 索引构建
-│   ├── hex_handler.py       # HEX 文件处理 + 编码
+│   ├── dcm_handler.py       # DCM 解析 + DCM 批量写入 HEX (基于 CalibSession)
+│   ├── hex_handler.py       # HEX 读写 + 标定值写入编码
 │   ├── calib_engine.py      # 在线标定引擎 (CalibSession)
 │   └── sync_engine.py       # 模型版本同步
 ├── utils/                   # 工具模块
@@ -110,8 +121,31 @@ A2l_Toolbox/
 ├── build.bat                # PyInstaller 打包脚本
 ├── CHANGELOG.md             # 更新日志
 ├── README.md                # 本文件
-└── test/                    # 测试数据
+└── test/                    # 测试
+    ├── regress/             # 自动化回归 (入库, CI 执行)
+    │   ├── fixtures.py      # 合成夹具: A2L + HEX (不依赖真机样本)
+    │   ├── _harness.py      # 极简断言框架 (不引入 pytest)
+    │   ├── test_hex_format.py    # HEX 读写/INCA 记录格式/值编码
+    │   ├── test_calib_engine.py  # COEFFS 方向/轴/存储方向/撤销/DCM 往返
+    │   ├── test_a2l_tools.py     # 地址映射/合并/模型同步
+    │   ├── test_gui_contract.py  # 页签契约 + 在线标定运行态
+    │   ├── run_all.py       # 入口: python test/regress/run_all.py
+    │   └── run_one.py       # 单模块调试用
+    └── (样本数据)            # 真机 A2L/HEX/DCM/ELF, 不入库 (.gitignore)
 ```
+
+## 回归测试
+
+```bash
+python test/regress/run_all.py     # 全部; 退出码 0=通过
+python test/regress/run_one.py test_calib_engine   # 单模块
+```
+
+用例全部基于 `fixtures.py` 现场合成的 A2L+HEX（小夹具），不依赖 `test/` 下的真机样本，
+因此 CI 与本地行为一致。覆盖点均为历史上真实出过问题的地方：COEFFS 方向（Simulink
+phys→raw）、字节序声明、MAP 的 `COLUMN_DIR` 存储方向、FIX_AXIS 隐式轴、段内 0xFF 填充、
+同名对象同步时保留整车真实地址、以及在线标定加载的运行态。
+
 
 ## 使用方法
 
@@ -122,6 +156,13 @@ python main.py
 ```
 
 GUI 启动时默认最大化；日志区固定在窗口底部，支持折叠，并可拖动日志区顶部边缘调整高度。
+
+启动时先显示加载屏（旋转动画 + 阶段文字），界面模块加载完成后淡出、主窗口淡入；
+启动失败会关闭加载屏并弹出错误框，不会留一个一直转圈的窗口。
+
+> 注意：EXE 为 onefile 单文件，双击后前约 3 秒是 PyInstaller 解包（此时加载屏还没出来）。
+> 这段空白与本工具有关的唯一解法是改用 onedir 目录形式发布（实测主窗口就绪 4.4s → 1.6s），
+> 但产物会从"一个 exe"变成"exe + _internal 目录"。
 ### 打包为 EXE
 
 ```
@@ -150,8 +191,12 @@ GitHub Actions 配置位于 `.github/workflows/ci.yml`，在 Windows runner 上�
 2. 选择包含 A2L 文件的文件夹
 3. 指定输出文件路径
 4. （可选）选择头文件 A2L — 合并内容将插入该文件的 Data 区域
-5. 可选勾选"包含子文件夹"
-6. 点击"开始合并"
+5. （可选）选择「符号归属MAP」— 同名对象按 MAP 中符号的定义模块判定归哪个 SWC，
+   只保留定义方那一份（不给则按名称前缀/限值启发式裁决，冲突写入 `<输出>_dedup.txt`）
+6. （可选）勾选「合并后更新 ECU 地址」— 用同一份 MAP 把 0x0000 占位填成真实地址
+   （只填空位，不改写已有地址）
+7. 可选勾选"包含子文件夹"
+8. 点击"开始合并"
 
 ### 模型版本同步操作流程
 
@@ -159,8 +204,21 @@ GitHub Actions 配置位于 `.github/workflows/ci.yml`，在 Windows runner 上�
 2. 添加一个或多个新版模型 A2L（支持多选）
 3. 选择 Base A2L（整车 A2L）和输出路径
 4. 可选勾选"删除旧版有而新版没有的对象"（完全以新版为准）
+   - 勾选后按"定义该对象的模块"判断归属（依据第 6 步选的 MAP）：属于本模型、但新版
+     已不再声明的一律删除，连它引用的旧 GROUP 与旧 COMPU_METHOD 一并清理；
+     MAP 显示由**别的模型**定义的对象一个都不动
+   - 只给了 ELF（无归属信息）时退回"按 CM 名称前缀"判断，模型内部子系统改过名就会漏删，
+     此时以日志里的"删除 0 个"为信号，改用 MAP
 5. 可选勾选"备份目标文件"（生成 .bak 备份）
-6. 可选勾选"同步完成后自动更新地址"并选择 ELF/MAP 地址文件——对输出整体刷新地址，一步完成"合成 + 刷新地址"
+6. 可选勾选"同步完成后自动更新地址"并选择 ELF/MAP 地址文件——对输出整体刷新地址，
+   一步完成"合成 + 刷新地址"
+   - 建议保留默认的「仅填补 0x0000 占位，不覆盖已有真实地址」：往整车 A2L 追加新模型时，
+     若所用 MAP 与整车 A2L 不是同一次构建，全量刷新会把已有地址整体改写
+     （实测：4 个模型同步后，安全模式只填 1435 个新对象、改动 0 个已有地址；
+     全量刷新会改写 39107 个）
+   - **地址文件选 `.map` 时还会自动按"定义方"裁决**：若某对象在 MAP 里由别的模型定义、
+     而整车 A2L 已有它，本模型只是引用方，则不覆盖（避免用引用方的 255 兜底把定义方的
+     真实限值放宽）。选 ELF 时无归属信息，退回"同名即覆盖"
 7. 点击"开始同步"
 
 ### DCM 写入 HEX 操作流程 (v1.9.2 起并入「在线标定」)

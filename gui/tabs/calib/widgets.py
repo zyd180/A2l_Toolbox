@@ -1,9 +1,22 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""通用控件 - CellGrid 可编辑网格 (色阶背景 / 选区 / TSV 复制粘贴)"""
+"""通用控件 - CellGrid 可编辑网格 (色阶背景 / 选区 / TSV 复制粘贴)
+
+V2.7.0 虚拟化重写: 每格不再创建 Frame+Label 两个 Tk 子窗口 (几十×几十的 MAP
+要建上千窗口, 打开编辑器明显卡顿), 改为 Canvas 单层绘制 (每格 2 个 canvas
+item, 无窗口对象), 事件统一绑定在 Canvas 上按坐标命中。
+
+公共 API 与旧版逐字兼容, 编辑器 (editors.py) 零改动:
+    set_data / refresh_value / selection_rect / focus_cell /
+    copy_selection / paste_from_clipboard / values / colors /
+    n_rows / n_cols / row_headers / col_headers / CELL_W / CELL_H
+"""
 
 import tkinter as tk
 from tkinter import ttk
+import tkinter.font as tkfont
+
+from gui.theme import COLORS, DIVIDER
 
 
 # 值 -> 颜色 (绿->黄->红 渐变, INCA 热图风格)
@@ -26,19 +39,27 @@ def parse_tsv(text):
     return rows
 
 
+# 视觉对齐 theme token (V2.7.0): 不再散落硬编码色值
+_BORDER = DIVIDER                        # 单元格描边 (替代旧 Frame bd=1 relief=solid 观感)
+_HDR_BG = COLORS['tab_idle']
+_HDR_FG = COLORS['text']
+_EDIT_BG = '#fffbe6'
+_SEL_FG = COLORS['primary_dark']
+_FG = COLORS['text']
+
+
 class CellGrid(tk.Frame):
-    """基于 Canvas+Entry 的可编辑二维网格.
+    """基于 Canvas 单层绘制的可编辑二维网格 (虚拟化, 每格 0 个子窗口).
 
     - 单元格色阶背景 (colors[i][j] 为 0~1 比例, None 则不着色)
     - 点击选格, Shift+点击/拖选矩形区, Ctrl+C/V TSV 与 Excel 互通
     - 双击进入编辑, Return/FocusOut 提交 on_edit(r,c,text)
-
-    注意: 事件必须绑定在单元格控件上而非 Canvas —— create_window 的
-    子窗口会拦截其覆盖区域内的所有鼠标事件
+    - 表头可双击编辑 (editable_headers 时), 提交 on_edit_header(kind, idx, text)
     """
 
     CELL_W = 86
     CELL_H = 24
+    _MAX_TEXT_CHARS = 14    # 86px / 微软雅黑9 的安全显示宽度, 超长截断加省略号
 
     def __init__(self, master, n_rows=0, n_cols=0, row_headers=None,
                  col_headers=None, readonly=False, on_edit=None,
@@ -54,14 +75,20 @@ class CellGrid(tk.Frame):
         self.col_headers = list(col_headers or [])
         self.values = [[''] * max(n_cols, 1) for _ in range(max(n_rows, 1))]
         self.colors = [[None] * max(n_cols, 1) for _ in range(max(n_rows, 1))]
-        self._cells = {}
-        self._headers = {}
+        self._rect = {}         # (r,c) -> canvas 矩形 item id
+        self._text = {}         # (r,c) -> canvas 文字 item id
+        self._hdr_rect = {}     # ('col'/'row', i) -> header 矩形 item id
+        self._hdr_text = {}
         self._anchor = None      # 选区锚点 (r,c)
         self._focus = None       # 当前格 (r,c)
         self._entry = None
+        self._entry_win = None   # 编辑 Entry 的 create_window id
         self._commit_cb = None
         self._top_band_text = ''
         self._corner_text = ''
+        self._yoff = 0
+        self._font = tkfont.Font(family='微软雅黑', size=9)
+        self._hdr_font = tkfont.Font(family='微软雅黑', size=8)
 
         self.canvas = tk.Canvas(self, highlightthickness=0, bg='#eef2f7')
         self.vsb = ttk.Scrollbar(self, orient='vertical', command=self.canvas.yview)
@@ -74,7 +101,10 @@ class CellGrid(tk.Frame):
         self.columnconfigure(0, weight=1)
 
         self.canvas.bind('<Configure>', lambda e: self._refresh())
-        self.canvas.bind('<Button-1>', lambda e: None)
+        # 事件统一在 Canvas 上按坐标命中 (虚拟化后没有子窗口拦截问题)
+        self.canvas.bind('<Button-1>', self._on_click)
+        self.canvas.bind('<Double-Button-1>', self._on_double)
+        self.canvas.bind('<B1-Motion>', self._on_drag)
         self.bind('<Control-c>', lambda e: self.copy_selection())
 
     # ---------- 数据 ----------
@@ -97,7 +127,6 @@ class CellGrid(tk.Frame):
             self._corner_text = corner_text
         self._anchor = None
         self._focus = None
-        self._destroy_cells()
         self._refresh()
 
     def refresh_value(self, r, c, text, color=None):
@@ -105,107 +134,94 @@ class CellGrid(tk.Frame):
             self.values[r][c] = text
             if color is not None:
                 self.colors[r][c] = color
-            w = self._cells.get((r, c))
-            if w is not None:
-                self._set_cell_text(w, text)
-                self._style_cell(r, c, w)
+            if (r, c) in self._rect:
+                self._style_cell(r, c)
 
-    # ---------- 内部构建 ----------
+    # ---------- 内部绘制 ----------
 
-    def _destroy_cells(self):
-        for w in self._cells.values():
-            w.destroy()
-        self._cells.clear()
-        for w in self._headers.values():
-            w.destroy()
-        self._headers.clear()
+    def _clip(self, s):
+        s = str(s)
+        if len(s) <= self._MAX_TEXT_CHARS:
+            return s
+        return s[:self._MAX_TEXT_CHARS - 1] + '…'
 
-    def _make_cell(self, r, c):
-        x0 = self.CELL_W * (c + 1)
-        y0 = self.CELL_H * (r + 1) + getattr(self, '_yoff', 0)
-        frm = tk.Frame(self.canvas, bd=1, relief='solid')
-        lbl = tk.Label(frm, text='', font=('微软雅黑', 9), takefocus=0)
-        lbl.place(x=0, y=0, width=self.CELL_W - 2, height=self.CELL_H - 2)
-        self.canvas.create_window(x0 + 1, y0 + 1, anchor='nw', window=frm,
-                                  width=self.CELL_W - 2, height=self.CELL_H - 2)
-        # 事件绑定在单元格控件上 (Canvas 收不到子窗口区域的点击)
-        for w in (frm, lbl):
-            w.bind('<Button-1>', lambda e, rr=r, cc=c: self._select(rr, cc, False))
-            w.bind('<Shift-Button-1>', lambda e, rr=r, cc=c: self._select(rr, cc, True))
-            w.bind('<Double-Button-1>', lambda e, rr=r, cc=c: self._edit_at(rr, cc))
-            w.bind('<B1-Motion>', lambda e, rr=r, cc=c: self._drag_to(rr, cc))
-        return frm
+    def _refresh(self):
+        for item in self.canvas.find_all():
+            self.canvas.delete(item)
+        self._rect.clear()
+        self._text.clear()
+        self._hdr_rect.clear()
+        self._hdr_text.clear()
+        if self._entry_win is not None:
+            self.canvas.delete(self._entry_win)
+            self._entry_win = None
+        self._yoff = self.CELL_H if self._top_band_text else 0
+        W, H = self.CELL_W, self.CELL_H
 
-    def _make_header(self, text, r, c):
-        """r=-1 列头; c=-1 行头; r=c=-1 角头. editable_headers 时可双击编辑"""
-        yoff = getattr(self, '_yoff', 0)
-        frm = tk.Frame(self.canvas, bd=1, relief='solid')
-        lbl = tk.Label(frm, text=str(text), font=('微软雅黑', 8),
-                       bg='#dbe3ee', fg='#1f2937', takefocus=0)
-        lbl.place(x=0, y=0, width=self.CELL_W - 2, height=self.CELL_H - 2)
+        # 顶部说明条 (单行, 保留为窗口控件以自动省略)
+        if self._yoff:
+            band = tk.Label(self.canvas, text=self._top_band_text,
+                            font=('微软雅黑', 8, 'bold'), bg='#e2e8f0',
+                            fg='#334155', anchor='w', padx=6)
+            self.canvas.create_window(W + 2, 1, anchor='nw', window=band,
+                                      width=max(W * self.n_cols - 2, 100),
+                                      height=H - 2)
+        # 表头行 / 列 / 角
+        self._draw_header(self._corner_text, -1, -1)
+        for c in range(self.n_cols):
+            self._draw_header(self.col_headers[c] if c < len(self.col_headers) else c, -1, c)
+        for r in range(self.n_rows):
+            self._draw_header(self.row_headers[r] if r < len(self.row_headers) else r, r, -1)
+            for c in range(self.n_cols):
+                x0 = W * (c + 1)
+                y0 = H * (r + 1) + self._yoff
+                rect = self.canvas.create_rectangle(
+                    x0 + 1, y0 + 1, x0 + W - 1, y0 + H - 1,
+                    fill='white', outline=_BORDER)
+                text = self.canvas.create_text(
+                    x0 + W // 2, y0 + H // 2, text=self._clip(self.values[r][c]),
+                    font=self._font, fill=_FG)
+                self._rect[(r, c)] = rect
+                self._text[(r, c)] = text
+                self._style_cell(r, c)
+        w = W * (self.n_cols + 1) + 4
+        h = H * (self.n_rows + 1) + self._yoff + 4
+        self.canvas.configure(scrollregion=(0, 0, w, h))
+
+    def _draw_header(self, text, r, c):
+        """r=-1 列头; c=-1 行头; r=c=-1 角头. editable_headers 时列/行头可双击编辑"""
+        W, H = self.CELL_W, self.CELL_H
+        yoff = self._yoff
         if r < 0 and c < 0:
-            self.canvas.create_window(1, 1 + yoff, anchor='nw', window=frm,
-                                      width=self.CELL_W - 2, height=self.CELL_H - 2)
-            self._headers[('corner',)] = frm
-            return frm
-        if r < 0:
-            kind, idx, x, y = 'col', c, self.CELL_W * (c + 1), 1 + yoff
+            x, y = 1, 1 + yoff
+            key = ('corner',)
+        elif r < 0:
+            x, y = W * (c + 1), 1 + yoff
+            key = ('col', c)
         else:
-            kind, idx, x, y = 'row', r, 1, self.CELL_H * (r + 1) + yoff
-        self.canvas.create_window(x, y, anchor='nw', window=frm,
-                                  width=self.CELL_W - 2, height=self.CELL_H - 2)
-        self._headers[(kind, idx)] = frm
-        if self.editable_headers and not self.readonly and self.on_edit_header:
-            for w in (frm, lbl):
-                w.bind('<Double-Button-1>',
-                       lambda e, k=kind, ii=idx: self._edit_header(k, ii))
-        return frm
+            x, y = 1, H * (r + 1) + yoff
+            key = ('row', r)
+        rect = self.canvas.create_rectangle(x, y, x + W - 2, y + H - 2,
+                                            fill=_HDR_BG, outline=_BORDER)
+        tid = self.canvas.create_text(x + W // 2 - 1, y + H // 2 - 1,
+                                      text=self._clip(text), font=self._hdr_font,
+                                      fill=_HDR_FG)
+        self._hdr_rect[key] = rect
+        self._hdr_text[key] = tid
 
-    def _edit_header(self, kind, idx):
-        """表头行内编辑 (轴点值), 提交回调 on_edit_header(kind, idx, text)"""
-        if self.readonly or self._entry is not None:
+    def _style_cell(self, r, c):
+        rect, text = self._rect.get((r, c)), self._text.get((r, c))
+        if rect is None:
             return
-        frm = self._headers.get((kind, idx))
-        if frm is None:
-            return
-        old = self.col_headers[idx] if kind == 'col' else self.row_headers[idx]
-        entry = tk.Entry(frm, font=('微软雅黑', 8), justify='center',
-                         bg='#fffbe6', highlightthickness=1,
-                         highlightbackground='#2563eb', highlightcolor='#2563eb')
-
-        def commit(event=None):
-            if self._entry is None:
-                return
-            txt = entry.get().strip()
-            self._entry = None
-            self._commit_cb = None
-            entry.destroy()
-            if txt != old and self.on_edit_header:
-                self.on_edit_header(kind, idx, txt)
-
-        def cancel(event=None):
-            self._entry = None
-            self._commit_cb = None
-            entry.destroy()
-
-        entry.insert(0, old)
-        entry.select_range(0, 'end')
-        entry.place(x=0, y=0, width=self.CELL_W - 4, height=self.CELL_H - 4)
-        entry.focus_set()
-        entry.bind('<Return>', commit)
-        entry.bind('<Escape>', cancel)
-        entry.bind('<FocusOut>', commit)
-        self._entry = entry
-        self._commit_cb = commit
-
-    def _style_cell(self, r, c, frm):
         frac = self.colors[r][c] if (r < len(self.colors) and c < len(self.colors[r])) else None
         bg = 'white' if frac is None else ramp_color(frac)
-        frm.configure(bg=bg)
-        in_sel = self._in_selection(r, c)
-        fg = '#1d4ed8' if in_sel else '#1f2937'
-        for ch in frm.winfo_children():
-            ch.configure(bg=bg, fg=fg)
+        fg = _SEL_FG if self._in_selection(r, c) else _FG
+        self.canvas.itemconfigure(rect, fill=bg)
+        self.canvas.itemconfigure(text, fill=fg, text=self._clip(self.values[r][c]))
+
+    def _recolor(self):
+        for (r, c) in self._rect:
+            self._style_cell(r, c)
 
     def _in_selection(self, r, c):
         if not self._anchor or not self._focus:
@@ -214,38 +230,47 @@ class CellGrid(tk.Frame):
         c0, c1 = sorted((self._anchor[1], self._focus[1]))
         return r0 <= r <= r1 and c0 <= c <= c1
 
-    def _refresh(self):
-        self._destroy_cells()
-        self._yoff = self.CELL_H if self._top_band_text else 0
-        if self._yoff:
-            band = tk.Label(self.canvas, text=self._top_band_text,
-                            font=('微软雅黑', 8, 'bold'), bg='#e2e8f0',
-                            fg='#334155', anchor='w', padx=6)
-            self.canvas.create_window(self.CELL_W + 2, 1, anchor='nw', window=band,
-                                      width=max(self.CELL_W * self.n_cols - 2, 100),
-                                      height=self.CELL_H - 2)
-        self._make_header(self._corner_text, -1, -1)
-        for c in range(self.n_cols):
-            self._make_header(self.col_headers[c] if c < len(self.col_headers) else c, -1, c)
-        for r in range(self.n_rows):
-            self._make_header(self.row_headers[r] if r < len(self.row_headers) else r, r, -1)
-            for c in range(self.n_cols):
-                frm = self._make_cell(r, c)
-                self._set_cell_text(frm, self.values[r][c])
-                self._style_cell(r, c, frm)
-                self._cells[(r, c)] = frm
-        w = self.CELL_W * (self.n_cols + 1) + 4
-        h = self.CELL_H * (self.n_rows + 1) + self._yoff + 4
-        self.canvas.configure(scrollregion=(0, 0, w, h))
+    # ---------- 命中测试 ----------
 
-    def _set_cell_text(self, frm, text):
-        kids = frm.winfo_children()
-        if kids:
-            kids[0].configure(text=text)
+    def _hit(self, x, y):
+        """Canvas 坐标 -> ('cell',r,c) / ('col',i) / ('row',i) / ('corner',) / None"""
+        W, H, yoff = self.CELL_W, self.CELL_H, self._yoff
+        if x < 0 or y < 0:
+            return None
+        if x < W and y < yoff + H:
+            return ('corner',)
+        if y < yoff + H:
+            c = int(x // W) - 1
+            return ('col', c) if 0 <= c < self.n_cols else None
+        if x < W:
+            r = int((y - yoff) // H) - 1
+            return ('row', r) if 0 <= r < self.n_rows else None
+        r = int((y - yoff) // H) - 1
+        c = int(x // W) - 1
+        if 0 <= r < self.n_rows and 0 <= c < self.n_cols:
+            return ('cell', r, c)
+        return None
 
-    def _recolor(self):
-        for (r, c), frm in self._cells.items():
-            self._style_cell(r, c, frm)
+    def _on_click(self, e):
+        hit = self._hit(e.x, e.y)
+        if hit and hit[0] == 'cell':
+            self._select(hit[1], hit[2], extend=bool(e.state & 0x0001))
+
+    def _on_drag(self, e):
+        hit = self._hit(e.x, e.y)
+        if hit and hit[0] == 'cell' and self._anchor and (hit[1], hit[2]) != self._focus:
+            self._focus = (hit[1], hit[2])
+            self._recolor()
+
+    def _on_double(self, e):
+        hit = self._hit(e.x, e.y)
+        if not hit:
+            return
+        if hit[0] == 'cell':
+            self._edit_at(hit[1], hit[2])
+        elif hit[0] in ('col', 'row') and self.editable_headers \
+                and not self.readonly and self.on_edit_header:
+            self._edit_header(hit[0], hit[1])
 
     # ---------- 选择 / 编辑 ----------
 
@@ -256,12 +281,8 @@ class CellGrid(tk.Frame):
             self._anchor = (r, c)
         self._recolor()
 
-    def _drag_to(self, r, c):
-        if self._anchor and (r, c) != self._focus:
-            self._focus = (r, c)
-            self._recolor()
-
     def _edit_at(self, r, c):
+        self._commit_editor()
         self._focus = (r, c)
         if not self._anchor:
             self._anchor = (r, c)
@@ -285,34 +306,83 @@ class CellGrid(tk.Frame):
         if self.readonly or self._entry is not None or self._focus is None:
             return
         r, c = self._focus
-        frm = self._cells.get((r, c))
-        if frm is None:
+        if (r, c) not in self._rect:
             return
         old = self.values[r][c]
-        entry = tk.Entry(frm, font=('微软雅黑', 9), justify='center',
-                         bg='#fffbe6', highlightthickness=1,
+        x0 = self.CELL_W * (c + 1)
+        y0 = self.CELL_H * (r + 1) + self._yoff
+        entry = tk.Entry(self.canvas, font=('微软雅黑', 9), justify='center',
+                         bg=_EDIT_BG, highlightthickness=1,
                          highlightbackground='#2563eb', highlightcolor='#2563eb')
 
         def commit(event=None):
             if self._entry is None:
                 return
             txt = entry.get().strip()
-            self._entry = None
-            self._commit_cb = None
-            entry.destroy()
+            self._teardown_entry()
             if txt != old:
-                self._set_cell_text(frm, txt)
+                if (r, c) in self._text:
+                    self.canvas.itemconfigure(self._text[(r, c)],
+                                              text=self._clip(txt))
                 if self.on_edit:
                     self.on_edit(r, c, txt)
 
         def cancel(event=None):
-            self._entry = None
-            self._commit_cb = None
-            entry.destroy()
+            self._teardown_entry()
 
         entry.insert(0, old)
         entry.select_range(0, 'end')
-        entry.place(x=0, y=0, width=self.CELL_W - 4, height=self.CELL_H - 4)
+        self._entry_win = self.canvas.create_window(
+            x0 + 3, y0 + 3, anchor='nw', window=entry,
+            width=self.CELL_W - 6, height=self.CELL_H - 6)
+        entry.focus_set()
+        entry.bind('<Return>', commit)
+        entry.bind('<Escape>', cancel)
+        entry.bind('<FocusOut>', commit)
+        self._entry = entry
+        self._commit_cb = commit
+
+    def _teardown_entry(self):
+        if self._entry is not None:
+            self._entry.destroy()
+            self._entry = None
+        if self._entry_win is not None:
+            self.canvas.delete(self._entry_win)
+            self._entry_win = None
+        self._commit_cb = None
+
+    def _edit_header(self, kind, idx):
+        """表头行内编辑 (轴点值), 提交回调 on_edit_header(kind, idx, text)"""
+        if self.readonly or self._entry is not None:
+            return
+        if (kind, idx) not in self._hdr_rect:
+            return
+        if kind == 'col':
+            old = self.col_headers[idx]
+            x0, y0 = self.CELL_W * (idx + 1), 1 + self._yoff
+        else:
+            old = self.row_headers[idx]
+            x0, y0 = 1, self.CELL_H * (idx + 1) + self._yoff
+        entry = tk.Entry(self.canvas, font=('微软雅黑', 8), justify='center',
+                         bg=_EDIT_BG, highlightthickness=1,
+                         highlightbackground='#2563eb', highlightcolor='#2563eb')
+
+        def commit(event=None):
+            if self._entry is None:
+                return
+            txt = entry.get().strip()
+            self._teardown_entry()
+            if txt != old and self.on_edit_header:
+                self.on_edit_header(kind, idx, txt)
+
+        def cancel(event=None):
+            self._teardown_entry()
+
+        entry.insert(0, old)
+        entry.select_range(0, 'end')
+        self._entry_win = self.canvas.create_window(
+            x0 + 2, y0 + 2, anchor='nw', window=entry,
+            width=self.CELL_W - 4, height=self.CELL_H - 4)
         entry.focus_set()
         entry.bind('<Return>', commit)
         entry.bind('<Escape>', cancel)
@@ -325,10 +395,7 @@ class CellGrid(tk.Frame):
             self._commit_cb()
 
     def _cancel_editor(self):
-        if self._entry is not None:
-            e, self._entry = self._entry, None
-            self._commit_cb = None
-            e.destroy()
+        self._teardown_entry()
 
     # ---------- 剪贴板 ----------
 

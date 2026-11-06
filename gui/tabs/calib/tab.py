@@ -16,6 +16,7 @@ from utils.logger import timestamp, save_log_file
 from utils import appstate
 from core.calib_engine import CalibSession, format_value
 from gui.tabs.base import BaseTab
+from gui.tabs.calib.detail import DetailPanel
 from gui.tabs.calib.editors import open_editor
 
 
@@ -139,11 +140,18 @@ class CalibTab(BaseTab):
 
         self.table.bind('<Double-1>', self.on_double_click)
         self.table.bind('<Return>', lambda e: self.open_selected())
+        self.table.bind('<<TreeviewSelect>>', self._on_table_select)
         menu = tk.Menu(self, tearoff=0)
         menu.add_command(label='编辑', command=self.open_selected)
         menu.add_command(label='还原原始值', command=self.restore_selected)
         menu.add_command(label='复制名称', command=self.copy_names)
         self.table.bind('<Button-3>', lambda e: menu.tk_popup(e.x_root, e.y_root))
+
+        # 右停靠面板「详情」页 (App._build_dock 先于本页签构建)
+        if hasattr(self.app, 'detail_page'):
+            self.detail_panel = DetailPanel(self.app.detail_page,
+                                            locate_cb=self._locate_object)
+            self.detail_panel.pack(fill='both', expand=True)
 
     def _bind_shortcuts(self):
         top = self.winfo_toplevel()
@@ -191,7 +199,7 @@ class CalibTab(BaseTab):
             return
         self._loading = True
         self.load_btn.config(state='disabled')
-        self.app._begin_running() if hasattr(self.app, '_begin_running') else None
+        self.app.begin_running()
         threading.Thread(target=self._do_load, args=(a2l, hx), daemon=True).start()
 
     def _do_load(self, a2l, hx):
@@ -214,8 +222,7 @@ class CalibTab(BaseTab):
         finally:
             self._loading = False
             self.winfo_toplevel().after(0, lambda: self.load_btn.config(state='normal'))
-            if hasattr(self.app, '_end_running'):
-                self.winfo_toplevel().after(0, self.app._end_running)
+            self.winfo_toplevel().after(0, self.app.end_running)
 
     def _after_load(self):
         self.save_btn.config(state='normal')
@@ -400,6 +407,47 @@ class CalibTab(BaseTab):
         self.table.delete(*self.table.get_children())
         for o in objs:
             self._append_row(o)
+        self._update_detail()
+
+    def _on_table_select(self, event=None):
+        self._update_detail()
+
+    def _locate_object(self, name):
+        """详情页「已修改对象」点击定位: 主表格选中 + 滚动可见.
+
+        实测: 程序化 selection_set 不触发 <<TreeviewSelect>> (用户点击才发),
+        详情刷新必须显式调用."""
+        if self.table.exists(name):
+            self.table.selection_set(name)
+            self.table.see(name)
+            self._update_detail()
+
+    def _update_detail(self):
+        """推送选中对象信息与已修改清单到右停靠面板「详情」页"""
+        panel = getattr(self, 'detail_panel', None)
+        s = self.session
+        if panel is None or s is None:
+            return
+        info = None
+        sel = self.table.selection()
+        if sel:
+            o = self._get_obj(sel[0])
+            if o is not None:
+                shape = '' if o.shape == (1,) else '[%s]' % 'x'.join(map(str, o.shape))
+                dirty = len(s.dirty_cells(o))
+                info = {
+                    'name': o.name,
+                    '类型': o.kind + shape,
+                    '数据类型': o.dtype,
+                    '单位': s.unit_of(o) or '-',
+                    '限值': '[%s, %s]' % (format_value(o.lower),
+                                          format_value(o.upper))
+                    if (o.lower is not None or o.upper is not None) else '-',
+                    '地址': ('0x%08X' % o.addr) if o.addr else '0x0000 (占位)',
+                    '已修改': ('%d 格' % dirty) if dirty else '-',
+                }
+        panel.set_object(info)
+        panel.set_dirty([o.name for o in s.dirty_objects()])
 
     def _append_row(self, o):
         s = self.session
@@ -442,6 +490,7 @@ class CalibTab(BaseTab):
         self.stat_lbl.configure(text='标定量 %d | 轴点 %d | 已修改 %d | Undo栈 %d'
                                 % (len(s.objects), len(s.axis_pts),
                                    n_dirty, len(s.undo_stack)))
+        self._update_detail()
 
     def refresh_all(self, obj_name=None):
         if not self.session:

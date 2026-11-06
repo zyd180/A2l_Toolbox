@@ -19,7 +19,7 @@ from core.hex_handler import (
     _DT_INFO,
 )
 
-from core.sync_engine import _read_lines, _parse_blocks
+from core.sync_engine import _read_lines, _parse_blocks, _comment_stripped
 
 
 # ==================== 数据类型辅助 ====================
@@ -56,8 +56,17 @@ _AXIS_DESCR_RE = re.compile(r'/begin\s+AXIS_DESCR(.*?)/end\s+AXIS_DESCR', re.DOT
 _AXIS_TYPE_RE = re.compile(r'Axis\s+Type\s*\*/\s*([A-Za-z_]\w*)')
 _AXIS_PTS_REF_RE = re.compile(r'AXIS_PTS_REF\s+([A-Za-z_]\w*)')
 _AXIS_N_RE = re.compile(r'Number of Axis Pts\s*\*/\s*(\d+)')
-_FIX_PAR_RE = re.compile(r'/begin\s+(FIX_AXIS_PAR|FIX_AXIS_PAR_DIST)\s*'
+# 兼容两种写法: 标准的 /begin FIX_AXIS_PAR ... /end 包裹形式, 以及
+# 本项目 A2L 生成器使用的裸关键字形式 "FIX_AXIS_PAR_DIST -4500 10 901"
+_FIX_PAR_RE = re.compile(r'(?:/begin\s+)?(FIX_AXIS_PAR_DIST|FIX_AXIS_PAR)\s+'
                          r'([-+\d.eE+]+)\s+([-+\d.eE+]+)\s+(\d+)')
+
+# MEMORY_SEGMENT: name "longid" PrgType MemType Attr Address Size ...
+# (A2L 中地址/长度为 0x 十六进制; 注释掉的旧定义行由 _comment_stripped 剔除)
+_MEM_SEG_RE = re.compile(
+    r'/begin\s+MEMORY_SEGMENT\s+[A-Za-z_]\w*\s+"[^"]*"\s+'
+    r'[A-Za-z_]\w*\s+[A-Za-z_]\w*\s+[A-Za-z_]\w*\s+'
+    r'(0[xX][0-9A-Fa-f]+|\d+)\s+(0[xX][0-9A-Fa-f]+|\d+)')
 
 # 旧版名称推断兜底 (Record Layout 名称 -> 数据类型)
 
@@ -143,7 +152,7 @@ class Characteristic(object):
 
     __slots__ = ('name', 'longid', 'kind', 'addr', 'dtype', 'cm', 'layout',
                  'lower', 'upper', 'fmt', 'shape', 'axes', 'array_size',
-                 'function', 'group')
+                 'function', 'functions', 'group')
 
     def __init__(self, name):
         self.name = name
@@ -160,6 +169,7 @@ class Characteristic(object):
         self.axes = []
         self.array_size = 1
         self.function = None
+        self.functions = []
         self.group = ''
 
 
@@ -203,6 +213,7 @@ class CalibSession(object):
         self.functions = {}
         self.groups = {}
         self.var_to_group = {}
+        self.mem_segments = []
         self._orig_bytes = {}
         self.undo_stack = []
         self.redo_stack = []
@@ -227,6 +238,16 @@ class CalibSession(object):
         blocks, _ = _parse_blocks(lines, need_text=True)
         named = [b for b in blocks if b.get('name')]
         log and log('  A2L 顶层命名块: %d' % len(named))
+
+        # MEMORY_SEGMENT 段定义 (save_hex 按段边界把段内缺字节补 0xFF, 对标 INCA 导出)
+        self.mem_segments = []
+        for m in _MEM_SEG_RE.finditer('\n'.join(_comment_stripped(lines))):
+            start = int(m.group(1), 0)
+            size = int(m.group(2), 0)
+            if size > 0:
+                self.mem_segments.append((start, start + size))
+        if self.mem_segments:
+            log and log('  MEMORY_SEGMENT: %d 个段' % len(self.mem_segments))
 
         for b in named:
             typ = b['type']
@@ -405,8 +426,13 @@ class CalibSession(object):
                 ax.upper = float(m.group(1))
             fm = _FIX_PAR_RE.search(seg_n)
             if fm:
-                offset, dist, number = float(fm.group(2)), float(fm.group(3)), int(fm.group(4))
-                ax.fix_values = [offset + i * dist for i in range(number)]
+                # FIX_AXIS_PAR: Offset Shift N -> 值 = offset + i * 2**shift
+                # FIX_AXIS_PAR_DIST: Offset Dist N -> 值 = offset + i * dist
+                # 注意: 此处得到的是 raw 值, 物理换算在 _resolve_objects 里按轴 CM 进行
+                offset, step, number = float(fm.group(2)), float(fm.group(3)), int(fm.group(4))
+                if fm.group(1) == 'FIX_AXIS_PAR':
+                    step = 2.0 ** step
+                ax.fix_values = [offset + i * step for i in range(number)]
                 ax.n = ax.n or number
             axes.append(ax)
         return axes
@@ -479,15 +505,38 @@ class CalibSession(object):
                     ax.pts_dtype = ref_obj.dtype
                     ax.n = ax.n or ref_obj.array_size
                     ax.cm = ax.cm or ref_obj.cm
-                if ax.type_ == 'FIX_AXIS' and ax.fix_values is None and ax.n:
-                    ax.fix_values = [float(i) for i in range(ax.n)]
+                if ax.type_ == 'FIX_AXIS':
+                    if ax.fix_values is None and ax.n:
+                        # A2L 未给出 FixAxisPar, 只能按占位序号填充
+                        ax.fix_values = [float(i) for i in range(ax.n)]
+                    elif ax.fix_values:
+                        # FixAxisPar 给出的是 raw 值, 需按轴 COMPU_METHOD 反解为物理值
+                        cm = self.cms.get(ax.cm) if ax.cm else None
+                        coeffs = cm.coeffs if cm else None
+                        if coeffs:
+                            conv = []
+                            bad = 0
+                            for v in ax.fix_values:
+                                pv = self.raw_to_phys(v, coeffs)
+                                if pv is None:
+                                    bad += 1
+                                    conv.append(v)
+                                else:
+                                    conv.append(pv)
+                            ax.fix_values = conv
+                            if bad:
+                                log and log('  警告: FIX_AXIS 轴 CM 换算 %d 点失败 (CM=%s), 保留 raw 值'
+                                            % (bad, ax.cm))
 
         for func, members in self.functions.items():
             for var in members:
                 for pool in (self.objects, self.axis_pts):
                     o = pool.get(var)
-                    if o is not None and not o.function:
-                        o.function = func
+                    if o is not None:
+                        if func not in o.functions:
+                            o.functions.append(func)
+                        if not o.function:
+                            o.function = func
         log and log('  标定量 %d, 轴 %d, 测量 %d, CM %d, LAYOUT %d, GROUP %d' %
                     (len(self.objects), len(self.axis_pts), len(self.measurements),
                      len(self.cms), len(self.layouts), len(self.groups)))
@@ -763,7 +812,25 @@ class CalibSession(object):
     # ---------- 保存 ----------
 
     def save_hex(self, path):
-        save_intel_hex(path, self.mem)
+        """保存 HEX. 对 A2L MEMORY_SEGMENT 定义的段, 段内缺失字节补 0xFF (对标 INCA
+        导出的完整段镜像); 段外空洞(保留区/未映射区)维持稀疏不输出"""
+        mem = self.mem
+        if self.mem_segments:
+            import bisect
+            keys = sorted(self.mem)
+            if keys:
+                mem = dict(self.mem)
+                for start, end in self.mem_segments:
+                    if end <= start or end <= keys[0] or start > keys[-1]:
+                        continue
+                    i = bisect.bisect_left(keys, start)
+                    if i >= len(keys) or keys[i] >= end:
+                        continue    # 段内无任何已有字节, 不铺 0xFF
+                    for a in range(start, end):
+                        if a not in mem:
+                            mem[a] = 0xFF
+        save_intel_hex(path, mem,
+                       eladr_addrs={start for start, _ in self.mem_segments})
 
     # ---------- DCM 导出 ----------
 
@@ -790,8 +857,10 @@ class CalibSession(object):
         entries = []
         used_funcs = set()
         skipped_names = []
+        # 排序与 INCA 对齐: 不区分大小写的字母序 (casefold), 同名再按原 名字稳定排序.
+        # 差异: 区分大小写的 ASCII 序会把 ADCC_* 排到 AccP_* 前面, 与 INCA 导出大段错位
         pool = sorted(list(self.objects.values()) + list(self.axis_pts.values()),
-                      key=lambda o: o.name)
+                      key=lambda o: (o.name.casefold(), o.name))
         for obj in pool:
             if only_dirty and not self.is_dirty(obj):
                 continue
@@ -801,29 +870,27 @@ class CalibSession(object):
                     skipped_names.append(obj.name)
                     continue
                 st = [num(v) for v in vals]
-                entries.append(['STUETZSTELLENVERTEILUNG %s X' % obj.name,
-                                '  LANGNAME %s' % dstr(obj.longid)])
-                if obj.function:
-                    entries[-1].append('  FUNKTION %s' % obj.function)
-                    used_funcs.add(obj.function)
+                # 对齐 INCA 导出: 块头写点数, *SST 标记, 不写 FUNKTION
+                e = ['STUETZSTELLENVERTEILUNG %s %d' % (obj.name, len(st)), '*SST',
+                     '  LANGNAME %s' % dstr(obj.longid)]
                 cm = self.cms.get(obj.cm)
                 if cm and cm.unit:
-                    entries[-1].append('  EINHEIT_X %s' % dstr(cm.unit))
-                entries[-1].append('  ST/X ' + ' '.join(st))
-                entries[-1].append('END')
+                    e.append('  EINHEIT_X %s' % dstr(cm.unit))
+                e.append('  ST/X ' + ' '.join(st))
+                e.append('END')
+                entries.append(e)
                 continue
             if all(v is None for v in vals):
                 skipped_names.append(obj.name)
                 continue
-            fn = '  FUNKTION %s' % obj.function if obj.function else None
-            if obj.function:
-                used_funcs.add(obj.function)
             unit = self.unit_of(obj)
 
             def common():
                 head = ['  LANGNAME %s' % dstr(obj.longid)]
-                if fn:
-                    head.append(fn)
+                # 对齐 INCA: 每个 FUNKTION 单独一行, 按名称排序输出
+                for f in sorted(obj.functions):
+                    head.append('  FUNKTION %s' % f)
+                    used_funcs.add(f)
                 if unit:
                     head.append('  EINHEIT_W %s' % dstr(unit))
                 return head
@@ -845,8 +912,18 @@ class CalibSession(object):
                 if not xs or any(v is None for v in xs) or any(v is None for v in vals):
                     skipped_names.append(obj.name)
                     continue
-                e = ['GRUPPENKENNLINIE %s X' % obj.name] + common()
+                ax0 = obj.axes[0] if obj.axes else None
+                is_fix = (ax0 is not None and ax0.type_ == 'FIX_AXIS')
+                # 对齐 INCA: FIX_AXIS 曲线导出为 FESTKENNLINIE, 其余为 GRUPPENKENNLINIE
+                if is_fix:
+                    e = ['FESTKENNLINIE %s %d' % (obj.name, len(vals))]
+                else:
+                    e = ['GRUPPENKENNLINIE %s %d' % (obj.name, len(vals))]
+                e += common()
                 e.append('  EINHEIT_X %s' % dstr(self._axis_unit(obj, 0)))
+                if not is_fix and ax0 is not None and ax0.ref:
+                    # 轴来源标注为注释 (INCA 惯例), 避免被当成 SX 引用解析
+                    e.append('*SSTX\t%s' % ax0.ref)
                 e.append('  ST/X ' + ' '.join(num(v) for v in xs))
                 e.extend(chunk([num(v) for v in vals]))
                 e.append('END')
@@ -862,9 +939,13 @@ class CalibSession(object):
                         or any(v is None for v in vals)):
                     skipped_names.append(obj.name)
                     continue
-                e = ['GRUPPENKENNFELD %s X Y' % obj.name] + common()
+                e = ['GRUPPENKENNFELD %s %d %d' % (obj.name, nx, ny)] + common()
                 e.append('  EINHEIT_X %s' % dstr(self._axis_unit(obj, 0)))
                 e.append('  EINHEIT_Y %s' % dstr(self._axis_unit(obj, 1)))
+                if obj.axes and obj.axes[0].ref:
+                    e.append('*SSTX\t%s' % obj.axes[0].ref)
+                if len(obj.axes) > 1 and obj.axes[1].ref:
+                    e.append('*SSTY\t%s' % obj.axes[1].ref)
                 e.append('  ST/X ' + ' '.join(num(v) for v in xs))
                 e.append('  ST/Y ' + ' '.join(num(v) for v in ys))
                 # DCM 的 WERT 按 ST/Y 逐行存放 (Y 外层, X 内层); 每行都带 WERT 关键字
@@ -890,7 +971,7 @@ class CalibSession(object):
         for e in entries:
             lines.extend(e)
             lines.append('')
-        with open(path, 'w', encoding='utf-8', newline='\r\n') as f:
+        with open(path, 'w', encoding='utf-8', errors='surrogateescape', newline='\r\n') as f:
             f.write('\n'.join(lines) + '\n')
         log and log('  DCM 导出: %d 个对象 (跳过 %d)' % (len(entries), len(skipped_names)))
         return {'exported': len(entries), 'skipped': len(skipped_names),

@@ -4,6 +4,11 @@
 
 - 运行: `python main.py` (或 `run_gui.bat`, 失败时自动打印日志)
 - 编译检查: `python -m py_compile` 全部 .py
+- **回归测试: `python test/regress/run_all.py`** (退出码 0 = 通过; 单模块用
+  `python test/regress/run_one.py test_calib_engine`)
+  - 用例基于 `test/regress/fixtures.py` 现场合成的 A2L+HEX, 不依赖 `test/` 下的真机样本
+  - 改核心算法 (COEFFS 方向/字节序/存储方向/编码) 前后必须跑; 修 bug 必须做
+    revert-to-fail (改回坏版本确认用例变红)
 - 打包: `pyinstaller A2L_Toolbox.spec`
 - GUI 回归脚本模式: 必须用 `root.mainloop()` + `after` 调度,
   **禁止** `withdraw()` 后裸 `update()` 轮询 (焦点/尺寸断言会假失败,
