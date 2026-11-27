@@ -72,7 +72,7 @@ class SyncTab(BaseTab):
         self.addr_row = ttk.Frame(self.body, style='Card.TFrame')
         file_row(self.addr_row, 0, '地址文件:', self.sym_var, self.browse_sym,
                  hint='按扩展名自动识别 ELF/MAP; 对同步输出整体执行地址更新')
-        self.only_missing_var = tk.BooleanVar(value=True)
+        self.only_missing_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(self.addr_row,
                         text='仅填补 0x0000 占位, 不覆盖已有真实地址',
                         variable=self.only_missing_var,
@@ -146,7 +146,7 @@ class SyncTab(BaseTab):
                          args=(sources, tgt, out, purge, backup, sym,
                                self.only_missing_var.get())).start()
 
-    def _run(self, sources, tgt, out, purge, backup, sym='', only_missing=True):
+    def _run(self, sources, tgt, out, purge, backup, sym='', only_missing=False):
         start = time.time()
         try:
             self.app.clear_log()

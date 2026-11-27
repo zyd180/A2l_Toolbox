@@ -58,6 +58,10 @@ class AddrTab(BaseTab):
         ttk.Checkbutton(opt, text='删除A2L中有但ELF/MAP中没有的变量',
                         variable=self.remove_var,
                         style='Card.TCheckbutton').pack(side='left', padx=SPACE['xs'])
+        self.only_missing_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opt, text='仅填补 0x0000 占位, 不覆盖已有真实地址',
+                        variable=self.only_missing_var,
+                        style='Card.TCheckbutton').pack(side='left', padx=SPACE['xl'])
 
     # ---------- 浏览 ----------
     def browse_src(self):
@@ -122,9 +126,10 @@ class AddrTab(BaseTab):
         appstate.save_app_state(addr_src=src, addr_in=a2l_in, addr_out=a2l_out)
         self.app.begin_running()
         threading.Thread(target=self._run, daemon=True,
-                         args=(src, a2l_in, a2l_out, self.remove_var.get())).start()
+                         args=(src, a2l_in, a2l_out, self.remove_var.get(),
+                               self.only_missing_var.get())).start()
 
-    def _run(self, src, a2l_in, a2l_out, remove_unmatched):
+    def _run(self, src, a2l_in, a2l_out, remove_unmatched, only_missing=False):
         start = time.time()
         try:
             self.app.clear_log()
@@ -138,6 +143,7 @@ class AddrTab(BaseTab):
             log(f'A2L输入: {a2l_in}')
             log(f'A2L输出: {a2l_out}')
             log(f"删除未匹配: {'是' if remove_unmatched else '否'}")
+            log(f"仅填占位:   {'是' if only_missing else '否 (覆盖已有地址)'}")
             log('=' * 60)
 
             log('\n[1/3] 解析源文件...')
@@ -147,7 +153,8 @@ class AddrTab(BaseTab):
 
             log('\n[2/3] 映射地址...')
             total, matched, updated, elf_only, stats = update_a2l_file(
-                a2l_in, self.symbols, a2l_out, remove_unmatched)
+                a2l_in, self.symbols, a2l_out, remove_unmatched,
+                only_missing=only_missing)
 
             log('\n[3/3] 保存完成')
             elapsed = time.time() - start

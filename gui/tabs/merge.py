@@ -52,8 +52,12 @@ class MergeTab(BaseTab):
         ttk.Checkbutton(opt, text='包含子文件夹', variable=self.recursive_var,
                         style='Card.TCheckbutton').pack(side='left', padx=SPACE['xs'])
         self.upd_addr_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opt, text='合并后更新 ECU 地址 (只填 0x0000 占位, 用上面的 MAP)',
+        ttk.Checkbutton(opt, text='合并后更新 ECU 地址 (用上面的 MAP)',
                         variable=self.upd_addr_var,
+                        style='Card.TCheckbutton').pack(side='left', padx=SPACE['xl'])
+        self.only_missing_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opt, text='仅填补 0x0000 占位, 不覆盖已有真实地址',
+                        variable=self.only_missing_var,
                         style='Card.TCheckbutton').pack(side='left', padx=SPACE['xl'])
 
     # ---------- 浏览 ----------
@@ -110,9 +114,10 @@ class MergeTab(BaseTab):
         self.app.begin_running()
         threading.Thread(target=self._run, daemon=True,
                          args=(folder, output, header, self.recursive_var.get(),
-                               sym, upd_addr)).start()
+                               sym, upd_addr, self.only_missing_var.get())).start()
 
-    def _run(self, folder, output, header, recursive, sym='', upd_addr=False):
+    def _run(self, folder, output, header, recursive, sym='', upd_addr=False,
+             only_missing=False):
         start = time.time()
         try:
             self.app.clear_log()
@@ -156,17 +161,18 @@ class MergeTab(BaseTab):
                 report = self._write_dedup_report(output, dedup)
                 log('  结构差异清单: %s' % report)
 
-            # 可选: 用同一个 MAP 把合并产物里的 0x0000 占位地址刷成真实地址
+            # 可选: 用同一个 MAP 刷新合并产物里的 ECU 地址
             addr_info = ''
             addr_stats = None
             if upd_addr:
-                log('\n[地址] 按 MAP 更新 ECU 地址 ...')
+                log('\n[地址] 按 MAP 更新 ECU 地址 (%s) ...'
+                    % ('仅填 0x0000 占位' if only_missing else '覆盖已有地址'))
                 from core.map_parser import parse_map_symbols
                 from core.a2l_parser import update_a2l_file
                 symbols = parse_map_symbols(sym)
                 log('  符号数: %d' % len(symbols))
                 total, matched, updated, _only, astats = update_a2l_file(
-                    output, symbols, output, only_missing=True)
+                    output, symbols, output, only_missing=only_missing)
                 rate = (100.0 * matched / total) if total else 0.0
                 log('  变量 %d | 匹配 %d (%.1f%%) | 地址更新 %d | 未匹配 %d'
                     % (total, matched, rate, updated, astats['unmatched']))
