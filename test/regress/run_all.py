@@ -19,6 +19,7 @@ MODULES = [
     'test_hex_format',
     'test_calib_engine',
     'test_a2l_tools',
+    'test_cli',
     'test_gui_widgets',
     'test_gui_contract',
 ]

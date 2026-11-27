@@ -177,6 +177,30 @@ GitHub Actions 配置位于 `.github/workflows/ci.yml`，在 Windows runner 上�
 
 双击 `push_github.bat`，或执行 `powershell -File scripts/push_github.ps1`。脚本会校验远程仓库为 `zyd180/A2l_Toolbox`，自动提交本地改动，并使用 `--force` 让本地分支覆盖远程分支；本地 `.rar` 交付压缩包不会被自动提交。可使用 `-DryRun` 只检查远程和分支，不执行提交或推送。
 
+### 命令行模式 (bat/脚本调用)
+
+同一个 `A2L_Toolbox.exe`：不带参数启动 GUI；带子命令则无界面执行，日志直接打印在调用它的 cmd/bat 窗口里（不弹新黑窗）。四个子命令：
+
+```bat
+rem 地址映射 (ELF/MAP 按扩展名识别; --only-missing 仅填 0x0000 占位)
+start /wait "" A2L_Toolbox.exe addr --src VCU.map --in car.a2l --out car_new.a2l --only-missing
+
+rem 合并 A2L (--map 同名按定义方去重; --upd-addr 合并后刷地址)
+start /wait "" A2L_Toolbox.exe merge --folder .\a2l_dir --out merged.a2l --map VCU.map --upd-addr
+
+rem 模型版本同步 (--src 可多个; --addr 同步后整体刷地址)
+start /wait "" A2L_Toolbox.exe sync --src model1.a2l model2.a2l --base car.a2l --out car.a2l --addr VCU.map --only-missing
+
+rem DCM 写入 HEX (与 GUI 导入 DCM + 保存 HEX 同一条代码路径)
+start /wait "" A2L_Toolbox.exe dcm --dcm cal.dcm --a2l car.a2l --hex fw.hex --out fw_new.hex
+```
+
+注意：
+- exe 是窗口程序，bat 里必须用 `start /wait ""` 调用才会等待结束，之后用 `%ERRORLEVEL%` 判断结果（0 成功 / 1 执行失败 / 2 参数错误）
+- 各子命令完整参数见 `A2L_Toolbox.exe <子命令> -h`；现成示例见 `cli_example.bat`
+- **bat 编写完整指南**（参数速查/批量循环/流水线/常见坑）：[docs/cli_bat_guide.md](docs/cli_bat_guide.md)
+- 源码方式同样可用：`python main.py addr --src ...`
+
 ### 地址映射操作流程
 
 1. 切换到「地址映射」标签页

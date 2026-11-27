@@ -1,5 +1,32 @@
 # 更新日志
 
+## V2.8.0 (2026-11-07)
+
+> 新增命令行模式: 同一个 exe, 不带参数进 GUI, 带子命令无界面执行,
+> 供 bat/脚本自动化调用; GUI 与核心算法零改动。
+
+### 功能
+- **命令行模式** (main.py 带参分发 → cli.py): 四个子命令对应四个功能
+  - `addr`: 地址映射 (--src ELF/MAP --in --out, 可选 --remove-unmatched / --only-missing)
+  - `merge`: 合并 A2L (--folder --out, 可选 --header / --map / --no-recursive / --upd-addr / --only-missing)
+  - `sync`: 模型版本同步 (--src 可多个 --base --out, 可选 --addr / --no-purge / --no-backup / --only-missing)
+  - `dcm`: DCM 写入 HEX (--dcm --a2l --hex --out, 与 GUI 导入 DCM+保存 HEX 同一条代码路径)
+  - `--version` 打印版本号; 地址更新默认覆盖已有地址, --only-missing 与 GUI 勾选项一致
+- **不弹黑窗**: exe 仍为窗口模式 (console=False); 从 bat/cmd 调用时用
+  AttachConsole 附着到调用方控制台输出日志 (并切 UTF-8 代码页), 不新开窗口;
+  无父控制台时日志落工作目录 A2L_Toolbox_cli.log
+- **退出码**: 0 成功 / 1 执行失败 (dcm 有超限错误也为 1) / 2 参数错误;
+  bat 里需 `start /wait ""` 调用才能等待结束并取 %ERRORLEVEL% (窗口程序特性)
+- 新增 `cli_example.bat` 四个功能的调用示例 (GBK 编码; 自动在 bat 同目录或 dist\
+  定位 exe; 示例路径缺失时给出修改提示; 结尾 pause 防双击一闪而过;
+  exe 调用后恢复控制台代码页并保留退出码)
+- 新增 `docs/cli_bat_guide.md` bat 编写指南 (start /wait 原理/参数速查/
+  批量循环/流水线/编码与代码页常见坑), 示例均经打包 exe 实测
+
+### 回归
+- 新增 test_cli.py (21 条: 四子命令进程内直调 + 退出码 + only_missing 行为
+  + DCM 写入值与参考一致); 全套 255/255 通过
+
 ## V2.7.1 (2026-11-07)
 
 > 地址更新行为统一: 三个入口一律默认覆盖已有地址, "仅填占位"改为可选勾选。

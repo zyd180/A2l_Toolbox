@@ -35,7 +35,7 @@ from gui.tabs.registry import A2L_TABS, CALIB_TAB
 from utils.config import VERSION
 from utils import appstate
 
-_DOCK_DEFAULT_W = 320
+_DOCK_DEFAULT_W = 460
 _DOCK_MIN_W = 220
 
 
@@ -82,11 +82,6 @@ class App:
         self.progress = ttk.Progressbar(self.status_frame, mode='indeterminate',
                                         style='Accent.Horizontal.TProgressbar',
                                         length=150)
-        # 折叠后重新展开停靠面板的小按钮 (藏于状态栏右侧)
-        self.dock_restore_btn = tk.Label(
-            self.status_frame, text='◂ 面板', bg=COLORS['ready_bg'],
-            fg=COLORS['primary_dark'], font=FONT['bold'], cursor='hand2', padx=8)
-        self.dock_restore_btn.bind('<Button-1>', lambda e: self._toggle_dock())
         self.status_var = tk.StringVar(value='  就绪')
         self.status_bar = tk.Label(self.status_frame, textvariable=self.status_var,
                                    anchor='w', bg=COLORS['ready_bg'], fg='#374151',
@@ -96,6 +91,13 @@ class App:
         # === 主体: 窄导航 + PanedWindow(中央 | 右停靠面板) ===
         body = tk.Frame(main, bg=COLORS['bg'])
         body.pack(fill='both', expand=True, padx=8, pady=(8, 4))
+
+        # 折叠后重新展开停靠面板的小按钮: place 悬浮于内容区右上角,
+        # 不占布局行 (pack 会挤出一行把内容整体推下去)
+        self.dock_restore_btn = tk.Label(
+            body, text='◂ 面板', bg=COLORS['card'],
+            fg=COLORS['primary_dark'], font=FONT['bold'], cursor='hand2', padx=8)
+        self.dock_restore_btn.bind('<Button-1>', lambda e: self._toggle_dock())
 
         self.sidenav = SideNav(body, on_select=self._on_nav, width=64)
         self.sidenav.pack(side='left', fill='y', padx=(0, 6))
@@ -200,7 +202,8 @@ class App:
                 self.paned.forget(self.dock)
             except tk.TclError:
                 return
-            self.dock_restore_btn.pack(side='right', before=self.status_bar)
+            self.dock_restore_btn.place(relx=1.0, x=-9, y=1, anchor='ne')
+            self.dock_restore_btn.lift()   # 先于 paned 创建, 不提升会被盖住
         else:
             if self.dock not in self.paned.panes():
                 # tk.PanedWindow 无 insert (那是 ttk 的 API); dock 本就是末位面板, add 即可
@@ -208,10 +211,14 @@ class App:
                                stretch='never',
                                width=max(_DOCK_MIN_W, self.dock.winfo_width()
                                          or _DOCK_DEFAULT_W))
-            self.dock_restore_btn.pack_forget()
+            self.dock_restore_btn.place_forget()
         appstate.save_app_state(dock_collapsed=1 if collapsed else 0)
 
     def _apply_dock_width(self, w):
+        # paneconfigure 会把已 forget 的窗口重新加回 PanedWindow,
+        # 折叠态恢复时不能碰, 否则启动恢复的折叠被静默撤销
+        if self.dock not in self.paned.panes():
+            return
         try:
             self.paned.paneconfigure(self.dock, width=w)
         except tk.TclError:
@@ -280,7 +287,10 @@ class App:
             self.clear_log()
         else:
             self._nav_ready = True
-        self.status('ready', self.a2l_tabs[sub].TITLE.strip())
+        # 启动期恢复子页签的延迟事件晚于导航恢复触发, 导航不在 A2L 页时
+        # 不能把子页签名写进状态栏 (否则与侧栏选中项对不上)
+        if self.nav_index == 0:
+            self.status('ready', self.a2l_tabs[sub].TITLE.strip())
 
     @property
     def active_tab(self):
